@@ -1,0 +1,1 @@
+ALTER TABLE "attempts" ADD COLUMN "reported_tx_hash" text;
