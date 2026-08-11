@@ -1,0 +1,33 @@
+{
+  "name": "agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./executor": "./executor.ts",
+    "./critique": "./critique.ts",
+    "./chain": "./chain.ts",
+    "./observe": "./observe.ts"
+  },
+  "scripts": {
+    "start": "tsx index.ts",
+    "standing": "tsx index.ts --settle",
+    "dev": "tsx watch index.ts",
+    "auth-probe": "tsx scripts/auth-probe.ts",
+    "first-tx": "tsx scripts/first-tx.ts",
+    "gate-2": "tsx scripts/gate-2.ts",
+    "settle": "tsx scripts/settle.ts"
+  },
+  "dependencies": {
+    "db": "workspace:*",
+    "dotenv": "^16",
+    "lib": "workspace:*",
+    "viem": "^2.55.11"
+  },
+  "devDependencies": {
+    "drizzle-orm": "^0.45.2",
+    "tsx": "^4",
+    "typescript": "^5",
+    "vitest": "^4.1.10"
+  }
+}
