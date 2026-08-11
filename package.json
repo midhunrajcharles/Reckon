@@ -1,0 +1,19 @@
+{
+  "name": "reckon",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Autonomous onchain settlement agent — KeeperHub Agents Onchain hackathon",
+  "scripts": {
+    "dev": "pnpm --filter app dev",
+    "build": "pnpm --filter app build",
+    "lint": "pnpm --filter app lint",
+    "agent": "pnpm --filter agent start",
+    "agent:standing": "pnpm --filter agent standing",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "dotenv": "^17.4.2",
+    "vitest": "^3"
+  },
+  "packageManager": "pnpm@10.26.2"
+}
