@@ -1,0 +1,45 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# env files — never commit real secrets
+.env
+.env.local
+.env.*.local
+
+# build output
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# editor/OS
+.DS_Store
+*.pem
+
+# vercel
+.vercel
+
+# Playwright MCP artifacts + local screenshots
+.playwright-mcp/
+*.png
+
+# demo film build artifacts — all regenerable from the three scripts.
+# marks.json is NOT ignored: it is the capture's evidence record.
+demo/work/
+demo/capture/*.webm
+demo/capture/*.mp4
+demo/final.mp4
+demo/vo/*.mp3
+demo/vo/*-alignment.json
+demo/assets/*.ttf
+
+# raw screen recordings
+rec/
