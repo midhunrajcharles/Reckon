@@ -1,0 +1,166 @@
+{
+  "_": "demo/trailer.md, as data. Interpreted by scripts/assemble-demo.ts --edl.",
+
+  "_source": "demo/capture/raw.webm is a 2 MiB, 1920x1080, duration=N/A stub — not the tape. The real capture is the file below: 3840x2160 / 698.2s, matching marks.json exactly (videoSize 3840x2160, totalMs 698741).",
+  "source": "demo/capture/page@c690709909030553e4e442dea887a91e.webm",
+  "marks": "demo/capture/marks.json",
+  "out": "demo/trailer.mp4",
+
+  "_geometry": "No crop is authored here. Every crop names a target MEASURED during capture; zoom is either a fill ratio or a ratio of frame width, never a rectangle.",
+
+  "_deviation_actI_punch": "trailer.md asks Act I to punch the `failed` cell in the REPORTED column. marks.json measured no such cell on the blockedRow shot — only `row` and `caption`. Rather than author coordinates, this punches the measured `caption` (the RETRY BLOCKED / 'One transaction, not two.' end of the row), which is the same beat's payload and is real geometry. To get the spec's exact framing, re-capture with a `reported` target on blockedRow.",
+
+  "_deviation_letterbox": "trailer.md specifies 2.39:1 throughout. Clips render through the film's shared renderPiece (16:9); only cards carry the letterbox hairlines. Letterboxing clips would mean changing a primitive the film depends on, so it is left alone deliberately.",
+
+  "_CUT_explorer": "trailer.md Act II ends on 4s of a public explorer showing the confirmed transaction. That shot is NOT in the capture: every frame across the whole 407s `basescan` mark (121.4s-528.6s) is an empty Blockscout shell — nav, search box, Log in, ad card, no transaction. marks.json's own evidence.explorerBody corroborates it (chrome text only, no tx fields). The transaction is real and confirmed — a Base Sepolia receipt returns status=success at block 45386595 — so this is a capture failure, not a false claim. But holding 4s on a blank page while implying independent verification is exactly what the honesty constraints forbid, so the shot is cut until it can be re-captured. Its 5s went to afterMatch (+2.5), scroll (+1.5) and slam (+1.0).",
+
+  "_KNOWN_matchcut": "The REPORTED and CHAIN TRUTH cells are adjacent columns ~188px apart, so any crop tight enough to isolate one from the other (zoom ~10x) is illegible. Both words are therefore visible in both halves of the match cut, which softens the 'one word different' reveal trailer.md is built around. Fixing it properly needs the two verdicts framed apart at capture time, not a different crop here.",
+
+  "_vo": "The trailer's 10 VO lines do not exist — demo/vo/ is absent and .env carries no TTS key. Every duration below is picture-derived, so narration can be added later without moving a single cut.",
+
+  "blocks": [
+    { "type": "black", "id": "coldOpen", "label": "cold open", "dur": 1.5 },
+
+    {
+      "type": "card", "id": "theLie", "label": "the lie", "dur": 2.5,
+      "lines": [
+        { "text": "A payment platform told an agent", "size": 46, "dy": -34 },
+        { "text": "the transaction failed.", "size": 46, "dy": 30 }
+      ]
+    },
+    {
+      "type": "card", "id": "itHadnt", "label": "it hadn't", "dur": 1.5,
+      "lines": [{ "text": "It hadn't.", "size": 76, "dy": 0 }]
+    },
+
+    {
+      "type": "clip", "id": "rowWide", "label": "A / the row", "dur": 5.5,
+      "shot": "blockedRow", "seek": "holdStart", "kb": [1.0, 1.04]
+    },
+    {
+      "type": "clip", "id": "rowPunch", "label": "A / punch the verdict", "dur": 1.2,
+      "shot": "blockedRow", "seek": "holdStart+5.5",
+      "crop": { "target": "caption", "zoom": 2.4 }
+    },
+    {
+      "type": "clip", "id": "rowWide2", "label": "A / back to wide", "dur": 1.8,
+      "shot": "blockedRow", "seek": "holdStart+6.7", "kb": [1.04, 1.055]
+    },
+    {
+      "type": "card", "id": "platformSaid", "label": "platform said failed", "dur": 1.5,
+      "lines": [{ "text": "THE PLATFORM SAID IT FAILED.", "size": 58, "dy": 0 }]
+    },
+
+    {
+      "type": "clip", "id": "injection", "label": "B / click + real wait", "dur": 9.263,
+      "shot": "reportedFailure", "endAtEvidenceMs": "reportedFailureRowVisibleAtMs",
+      "kb": [1.0, 1.03],
+      "_": "Anchored to the ms the row became visible, so the clip ENDS on the row landing and the real latency ahead of it survives whole. Only the approach is shortened. trailer.md pays for the overrun by taking it out of Act III."
+    },
+    {
+      "type": "clip", "id": "reportedPunch", "label": "B / REPORTED: failed", "dur": 1.3,
+      "shot": "reportedFailure", "seek": "reported.atMs",
+      "crop": { "target": "reported", "matchZoomWith": "chainTruth", "fill": 0.62, "min": 1.7, "max": 2.4 }
+    },
+    {
+      "type": "clip", "id": "matchcut", "label": "B / MATCH CUT → CHAIN TRUTH", "dur": 2.0,
+      "shot": "reportedFailure", "seek": 80.658,
+      "crop": { "target": "chainTruth", "matchZoomWith": "reported", "fill": 0.62, "min": 1.7, "max": 2.4 },
+      "_": "matchZoomWith forces ONE crop size across both cells: identical framing, one word different. This is the cut the trailer exists for."
+    },
+    {
+      "type": "clip", "id": "afterMatch", "label": "B / hold the hash on screen", "dur": 3.437,
+      "shot": "reportedFailure", "seek": 82.658, "kb": [1.0, 1.02],
+      "_": "Absorbs 2.5s of the cut explorer shot. The row on screen carries `success · 45386595` and `0x55afeac5…df735d` — the viewer can verify it themselves, which is the claim Act II is actually entitled to make from this footage."
+    },
+
+    {
+      "type": "clip", "id": "hashPunch", "label": "C / the hash", "dur": 1.0,
+      "shot": "basescan", "seek": "hash.atMs",
+      "crop": { "target": "hash", "fill": 0.7, "min": 1.8, "max": 3.0 }
+    },
+
+
+    {
+      "type": "clip", "id": "gasWide", "label": "D / two rows land", "dur": 1.6,
+      "shot": "gasSpike", "seek": 549.4, "kb": [1.0, 1.02]
+    },
+    {
+      "type": "clip", "id": "noBroadcast", "label": "D / NO BROADCAST", "dur": 1.4,
+      "shot": "gasSpike", "seek": "noBroadcast.atMs",
+      "crop": { "target": "noBroadcast", "fill": 0.5, "min": 1.9, "max": 3.0 }
+    },
+    {
+      "type": "clip", "id": "settled", "label": "D / SETTLED", "dur": 1.2,
+      "shot": "gasSpike", "seek": "settled.atMs",
+      "crop": { "target": "settled", "fill": 0.5, "min": 1.9, "max": 3.0 }
+    },
+    {
+      "type": "clip", "id": "gasWide2", "label": "D / wide", "dur": 1.8,
+      "shot": "gasSpike", "seek": 552.6, "kb": [1.02, 1.035]
+    },
+    {
+      "type": "clip", "id": "bothRows", "label": "D / pull back — both rows", "dur": 1.5,
+      "shot": "gasSpike", "seek": "bothRows.atMs",
+      "crop": { "target": "bothRows", "fill": 0.94, "min": 1.0, "max": 1.35 }
+    },
+    { "type": "clip", "id": "gasSettle", "label": "D / settle", "dur": 0.5, "shot": "gasSpike", "seek": 556.9 },
+
+    {
+      "type": "clip", "id": "scroll", "label": "E / the scroll", "dur": 7.5,
+      "shot": "settledHistory", "seek": "holdStart",
+      "_": "No Ken Burns — the scroll is the motion."
+    },
+    {
+      "type": "clip", "id": "slam", "label": "E / SLAM TO STILL", "dur": 5.0,
+      "shot": "settledHistory", "seek": "holdStart+7.5", "freeze": true
+    },
+    {
+      "type": "clip", "id": "retryBlocked", "label": "E / RETRY BLOCKED", "dur": 3.0,
+      "shot": "reportedFailure", "seek": "stamp.atMs",
+      "crop": { "target": "stamp", "fill": 0.5, "min": 1.9, "max": 3.0 }
+    },
+
+    {
+      "type": "card", "id": "oneTransaction", "label": "one transaction", "dur": 3.5,
+      "lines": [{ "text": "One transaction, not two.", "size": 64, "dy": 0 }]
+    },
+    { "type": "black", "id": "silence", "label": "TRUE SILENCE", "dur": 2.0 },
+
+    {
+      "type": "card", "id": "counterCard", "label": "counter card", "dur": 4.0,
+      "lines": [
+        { "text": "{{settledAfter}}", "size": 58, "dy": -168 },
+        { "text": "SETTLED ONCHAIN", "size": 22, "dy": -122 },
+        { "text": "{{reconciledAfter}}", "size": 58, "dy": -56 },
+        { "text": "INDEPENDENTLY RECONCILED", "size": 22, "dy": -10 },
+        { "text": "{{discrepanciesAfter}}", "size": 58, "dy": 56 },
+        { "text": "DISCREPANCIES CAUGHT", "size": 22, "dy": 102 },
+        { "text": "ZERO", "size": 58, "dy": 168 },
+        { "text": "DOUBLE PAYMENTS", "size": 22, "dy": 214 }
+      ],
+      "_zero": "ZERO is hard-typed on purpose, per trailer.md: a structural claim about the ledger, not a reading off it. If it stops being true the trailer must break loudly rather than quietly render a new number. Do not tokenise it."
+    },
+    {
+      "type": "card", "id": "finalCard", "label": "RECKON", "dur": 6.5, "fadeOut": true,
+      "lines": [
+        { "text": "RECKON", "size": 124, "dy": -40 },
+        { "text": "Reported status is a hypothesis.", "size": 28, "dy": 62 },
+        { "text": "reckon-bay.vercel.app", "size": 22, "dy": 112 }
+      ]
+    }
+  ],
+
+  "audio": {
+    "_": "Three impacts and one absence. Impacts name blocks, not timestamps, so a picture change can never desync a hit.",
+    "bedLevelDb": -26,
+    "hitLevelDb": -11,
+    "bedSegments": [
+      { "fromId": "itHadnt", "toId": "silence" },
+      { "fromId": "counterCard", "toId": "finalCard" }
+    ],
+    "ticks": { "fromId": "itHadnt", "toId": "matchcut", "levelDb": -30, "periodS": 1.0 },
+    "impacts": ["matchcut", "retryBlocked", { "id": "counterCard", "levelDb": -8 }],
+    "silence": { "fromId": "silence", "toId": "counterCard" }
+  }
+}

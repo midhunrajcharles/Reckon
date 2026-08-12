@@ -1,0 +1,21 @@
+{
+  "source": "basescan.mp4",
+  "padSeconds": 7,
+  "marks": [
+    {
+      "shot": "basescan",
+      "startMs": 5499,
+      "endMs": 49227,
+      "specHoldS": 20
+    }
+  ],
+  "evidence": {
+    "taskId": "demo-failure-1786526370418",
+    "txHash": "0xac03c2425c143eb1a4967c4f01a643d2a757c40f64ee2f6fcf125bc1ed7ddcdb",
+    "siteHref": "https://sepolia.basescan.org/tx/0xac03c2425c143eb1a4967c4f01a643d2a757c40f64ee2f6fcf125bc1ed7ddcdb",
+    "explorerUrl": "https://base-sepolia.blockscout.com/tx/0xac03c2425c143eb1a4967c4f01a643d2a757c40f64ee2f6fcf125bc1ed7ddcdb",
+    "adsHidden": true,
+    "explorerTitle": "Base Sepolia transaction 0xac03c2425c143eb1a4967c4f01a643d2a757c40f64ee2f6fcf125bc1ed7ddcdb | Blockscout",
+    "explorerBody": "Chains | Gas < 0.1 Gwei Blockchain Tokens Dapps Charts & stats API Other / Log in Transaction details 0xDc...9613 called execute on TKGasStation 1 Explorer Details Token transfers User operations Internal txns Logs State Raw trace This is a testnet transaction only Transaction hash 0xac03c2425c143eb1a4967c4f01a643d2a757c40f64ee2f6fcf125bc1ed7ddcdb Status and method Success execute Block 45379043 |"
+  }
+}

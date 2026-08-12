@@ -1,0 +1,215 @@
+{
+  "url": "https://reckon-bay.vercel.app",
+  "viewport": {
+    "width": 1920,
+    "height": 1080
+  },
+  "deviceScaleFactor": 2,
+  "videoSize": {
+    "width": 3840,
+    "height": 2160
+  },
+  "padSeconds": 8,
+  "totalMs": 698741,
+  "marks": [
+    {
+      "shot": "blockedRow",
+      "startMs": 4832,
+      "endMs": 37596,
+      "specHoldS": 20
+    },
+    {
+      "shot": "counters",
+      "startMs": 37596,
+      "endMs": 65101,
+      "specHoldS": 16
+    },
+    {
+      "shot": "reportedFailure",
+      "startMs": 65101,
+      "endMs": 121416,
+      "specHoldS": 34
+    },
+    {
+      "shot": "basescan",
+      "startMs": 121416,
+      "endMs": 528644,
+      "specHoldS": 14
+    },
+    {
+      "shot": "gasSpike",
+      "startMs": 528648,
+      "endMs": 579019,
+      "specHoldS": 20
+    },
+    {
+      "shot": "settledHistory",
+      "startMs": 579019,
+      "endMs": 658751,
+      "specHoldS": 24
+    },
+    {
+      "shot": "fullPage",
+      "startMs": 658752,
+      "endMs": 698741,
+      "specHoldS": 26
+    }
+  ],
+  "targets": {
+    "blockedRow": {
+      "caption": {
+        "x": 1410.171875,
+        "y": 503.75,
+        "w": 168,
+        "h": 64,
+        "atMs": 9576,
+        "scrollY": 1219
+      },
+      "row": {
+        "x": 402,
+        "y": 453.25,
+        "w": 1116,
+        "h": 132,
+        "atMs": 9585,
+        "scrollY": 1219
+      }
+    },
+    "counters": {
+      "discrepancies": {
+        "x": 1172.65625,
+        "y": 252.75,
+        "w": 345.34375,
+        "h": 136,
+        "atMs": 41074,
+        "scrollY": 802
+      },
+      "all": {
+        "x": 402,
+        "y": 252.75,
+        "w": 1116,
+        "h": 136,
+        "atMs": 41085,
+        "scrollY": 802
+      }
+    },
+    "reportedFailure": {
+      "reported": {
+        "x": 1039.9375,
+        "y": 268.25,
+        "w": 163.8125,
+        "h": 39,
+        "atMs": 79358,
+        "scrollY": 1397
+      },
+      "chainTruth": {
+        "x": 1227.75,
+        "y": 266,
+        "w": 158.421875,
+        "h": 43.5,
+        "atMs": 79373,
+        "scrollY": 1397
+      },
+      "stamp": {
+        "x": 1409.95068359375,
+        "y": 238.4479217529297,
+        "w": 140.1298828125,
+        "h": 27.604141235351562,
+        "atMs": 79387,
+        "scrollY": 1397
+      },
+      "caption": {
+        "x": 1410.171875,
+        "y": 272.75,
+        "w": 168,
+        "h": 64,
+        "atMs": 79396,
+        "scrollY": 1397
+      },
+      "row": {
+        "x": 402,
+        "y": 222.25,
+        "w": 1116,
+        "h": 132,
+        "atMs": 79405,
+        "scrollY": 1397
+      }
+    },
+    "basescan": {
+      "hash": {
+        "x": 1245.75,
+        "y": 290.5,
+        "w": 132.609375,
+        "h": 17,
+        "atMs": 121438,
+        "scrollY": 1397
+      }
+    },
+    "gasSpike": {
+      "noBroadcast": {
+        "x": 1367.635009765625,
+        "y": 297.349365234375,
+        "w": 134.52685546875,
+        "h": 26.80126953125,
+        "atMs": 550951,
+        "scrollY": 1376
+      },
+      "noBroadcastTruth": {
+        "x": 1205.609375,
+        "y": 281,
+        "w": 104.375,
+        "h": 58.5,
+        "atMs": 550969,
+        "scrollY": 1376
+      },
+      "settled": {
+        "x": 1422.31005859375,
+        "y": 231.0848846435547,
+        "w": 84.9892578125,
+        "h": 27.330245971679688,
+        "atMs": 550992,
+        "scrollY": 1376
+      },
+      "bothRows": {
+        "x": 402,
+        "y": 211.75,
+        "w": 1116,
+        "h": 3762,
+        "atMs": 551002,
+        "scrollY": 1376
+      }
+    }
+  },
+  "evidence": {
+    "blockedRowText": "demo-failure-1786526370418 amount 0 → 0x4807d351…ce72e8 clean · 21227 #0 chaos:inject_reported_failed failed 72gp1gv2so9yt7r07kmjv success · 45379043 0xac03c242…7ddcdb RETRY BLOCKED One transaction, not two.",
+    "countersAtCapture": {
+      "Settled onchain": "60",
+      "Attempts reconciled": "68",
+      "Discrepancies caught": "8"
+    },
+    "reportedFailureClickedAtMs": 71584,
+    "reportedFailureStatus": "Settlement demo-failure-1786541474241 mined onchain; told \"failed\" anyway. Reckon read the chain, blocked the intent, and refused the retry — one transaction, not two.",
+    "reportedFailureTaskId": "demo-failure-1786541474241",
+    "reportedFailureLatencyMs": 4627,
+    "reportedFailureRowVisibleAtMs": 79347,
+    "reportedFailureRowText": "demo-failure-1786541474241 amount 0 → 0x4807d351…ce72e8 clean · 21227 #0 chaos:inject_reported_failed failed co9wo6tbfx9efx4qpkxf6 success · 45386595 0x55afeac5…df735d RETRY BLOCKED One transaction, not two.",
+    "rowLinkHref": "https://sepolia.basescan.org/tx/0x55afeac5bfe11f3ef90548e9ff34601d65cc684c7f75840887ffdd7c5adf735d",
+    "txHash": "0x55afeac5bfe11f3ef90548e9ff34601d65cc684c7f75840887ffdd7c5adf735d",
+    "explorerUrl": "https://base-sepolia.blockscout.com/tx/0x55afeac5bfe11f3ef90548e9ff34601d65cc684c7f75840887ffdd7c5adf735d",
+    "adsHidden": 0,
+    "explorerTitle": "Base Sepolia transaction 0x55afeac5bfe11f3ef90548e9ff34601d65cc684c7f75840887ffdd7c5adf735d | Blockscout",
+    "explorerBody": "Chains | Gas < 0.1 Gwei Blockchain Tokens Dapps Charts & stats API Other / Log in Made with Blockscout is a tool for inspecting and analyzing EVM based blockchains. Blockchain explorer for Ethereum Networks. Backend: v11.2.6 Frontend: v2.10.3 Copyright © Blockscout Limited 2023-2026 This site is protected by reCAPTCHA and the Google Privacy Policy and Terms of Service apply. Blockscout Contribute ",
+    "gasSpikeClickedAtMs": 541862,
+    "gasSpikeStatus": "Bid refused by the injected spike; Reckon escalated to 1.5× and settled demo-gas-1786541944645 for real.",
+    "gasSpikeTaskId": "demo-gas-1786541944645",
+    "gasSpikeRowCount": 2,
+    "gasSpikeRowsText": [
+      "demo-gas-1786541944645 amount 0 → 0x4807d351…ce72e8 clean · 21227 #1 retry:gas_escalated completed mp2o4ug9gtu7q5rd8jmet success · 45386830 0xd27ac428…67d7c8 SETTLED",
+      "demo-gas-1786541944645 amount 0 → 0x4807d351…ce72e8 clean · 21227 #0 chaos:inject_gas_spike_bid_refused failed nothing sent — no hash NO BROADCAST"
+    ],
+    "countersAtEnd": {
+      "Settled onchain": "61",
+      "Attempts reconciled": "70",
+      "Discrepancies caught": "9"
+    }
+  }
+}

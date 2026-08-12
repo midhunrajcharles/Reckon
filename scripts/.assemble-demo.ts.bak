@@ -1,0 +1,1842 @@
+/**
+ * Assemble demo/final.mp4 — the film described in demo/script.md.
+ *
+ * Inputs
+ *   demo/capture/raw.webm      3840x2160 source (2x device scale)
+ *   demo/capture/marks.json    shot boundaries + punch-in target geometry
+ *   demo/vo/manifest.json      per-paragraph narration + word-accurate cue times
+ *
+ * Rules this encodes, from the script's honesty constraints:
+ *   - Audio is NEVER time-stretched. If a paragraph outruns the footage
+ *     captured for it, the build fails rather than speeding anything up.
+ *   - The injection latency is never trimmed. Where a real wait outruns the
+ *     narration, the NARRATION is delayed to meet the picture — the picture is
+ *     never cut to meet the narration.
+ *   - Every crop is derived from geometry measured during the capture. No pixel
+ *     coordinate is authored here.
+ *   - Punch-ins are hard cuts to a static crop, never animated zooms.
+ *
+ *   pnpm exec tsx scripts/assemble-demo.ts
+ */
+import "dotenv/config";
+import { execFile } from "node:child_process";
+import { mkdir, readFile, writeFile, rm, access } from "node:fs/promises";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+const run = promisify(execFile);
+
+const DEMO = join(process.cwd(), "demo");
+const CAP = join(DEMO, "capture");
+const VO = join(DEMO, "vo");
+const WORK = join(DEMO, "work");
+const ASSETS = join(DEMO, "assets");
+/**
+ * Source and destination are `let` because `--edl` repoints them.
+ *
+ * The film reads the canonical raw.webm; a trailer EDL names its own source so
+ * an edit can be cut from a different take without disturbing the film's build.
+ */
+let RAW = join(CAP, "raw.webm");
+let FINAL = join(DEMO, "final.mp4");
+
+const W = 1920;
+const H = 1080;
+const FPS = 30;
+
+/** Breathing room around narration, in seconds. */
+const LEAD_SILENCE = 0.45;
+const TAIL_SILENCE = 0.6;
+
+/**
+ * How much of the approach to a chaos button survives the cut, in seconds.
+ *
+ * This trims the scroll that gets the cursor to the button — navigation, not
+ * evidence. It does NOT touch the interval between the click and the row
+ * appearing: that latency is the real cost of a real settlement and the script
+ * forbids trimming it. `evidence.*ClickedAtMs` is what separates the two.
+ */
+const APPROACH_LEAD_S = 3.2;
+
+/** Ken Burns: 1.00 → 1.06 across a static hold. */
+const KB_FROM = 1.0;
+const KB_TO = 1.06;
+
+/** Audio levels. Narration sits at unity; nothing competes with a word. */
+const BED_DB = -26;
+const HIT_DB = -11;
+
+const HARD_CAP_S = 165; // 2:45
+const TARGET_S = 139; // 2:19
+
+/** Instrument Serif, to match the site's display face. OFL; cached locally. */
+const FONT_FILE = join(ASSETS, "InstrumentSerif-Regular.ttf");
+const FONT_URL =
+  "https://github.com/google/fonts/raw/main/ofl/instrumentserif/InstrumentSerif-Regular.ttf";
+const FONT_FALLBACK = "C:/Windows/Fonts/georgia.ttf";
+
+// ── Types ──────────────────────────────────────────────────────────────────
+
+interface Mark {
+  shot: string;
+  startMs: number;
+  endMs: number;
+  specHoldS: number;
+}
+interface Target {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  atMs: number;
+  scrollY: number;
+}
+interface MarksFile {
+  viewport: { width: number; height: number };
+  deviceScaleFactor: number;
+  videoSize: { width: number; height: number };
+  padSeconds: number;
+  marks: Mark[];
+  targets: Record<string, Record<string, Target>>;
+  evidence: Record<string, unknown>;
+}
+interface VoEntry {
+  index: number;
+  id: string;
+  key: string;
+  file: string;
+  duration: number;
+  text: string;
+  cues: Record<string, number>;
+}
+
+/** A rectangle in SOURCE (device) pixels. */
+interface Crop {
+  w: number;
+  h: number;
+  x: number;
+  y: number;
+}
+
+/** One contiguous slice of source, with the transform applied to it. */
+interface Piece {
+  srcStartS: number;
+  durS: number;
+  /** Static crop (a punch-in), or undefined for the wide frame. */
+  crop?: Crop;
+  /** Ken Burns zoom over this piece; omitted on punches and still shots. */
+  kb?: { from: number; to: number };
+  label: string;
+}
+
+type Block =
+  | { kind: "black"; durS: number; label: string }
+  | { kind: "card"; durS: number; label: string; lines: CardLine[]; letterbox?: boolean; fadeOut?: boolean }
+  | { kind: "shot"; key: string; durS: number; label: string; pieces: Piece[]; vo: VoEntry; voStartS: number; fadeFromS?: number };
+
+interface CardLine {
+  text: string;
+  size: number;
+  /** Vertical offset from centre, in px. */
+  dy: number;
+  tracking?: number;
+}
+
+// ── ffmpeg helpers ─────────────────────────────────────────────────────────
+
+async function ffmpeg(args: string[]): Promise<void> {
+  await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args], {
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+async function probeDuration(file: string): Promise<number> {
+  const { stdout } = await run("ffprobe", [
+    "-v", "error", "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1", file,
+  ]);
+  return Number(stdout.trim());
+}
+
+const exists = async (p: string): Promise<boolean> => {
+  try {
+    await access(p);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** ffmpeg paths are passed relative to cwd — a Windows drive colon breaks filter parsing. */
+const rel = (abs: string): string => abs.replace(process.cwd(), "").replace(/^[\\/]/, "").replace(/\\/g, "/");
+
+/**
+ * A path safe to embed inside a filter description.
+ *
+ * Anything under cwd goes in relative, which sidesteps the drive colon
+ * entirely; only an out-of-tree path (the Georgia fallback) needs escaping,
+ * and there the backslash-colon has to survive both the filter parser and the
+ * option-splitter, hence the double escape.
+ */
+function filterPath(abs: string): string {
+  const r = rel(abs);
+  if (!r.match(/^[A-Za-z]:/) && r !== abs.replace(/\\/g, "/")) return r;
+  return abs.replace(/\\/g, "/").replace(/:/g, "\\\\:");
+}
+
+// ── Crop geometry ──────────────────────────────────────────────────────────
+
+/**
+ * A 16:9 crop centred on a target, in source pixels.
+ *
+ * `zoom` is relative to the full frame: 2.4 means the output shows 1/2.4 of the
+ * frame's width. The rect is clamped to the frame, which shifts rather than
+ * shrinks it — a punch that would run off the edge stays the specified size so
+ * the match-cut pair keeps identical framing.
+ */
+function cropAt(target: Target, zoom: number, scale: number, video: { width: number; height: number }): Crop {
+  const w = Math.round(video.width / zoom / 2) * 2;
+  const h = Math.round(video.height / zoom / 2) * 2;
+  const cx = (target.x + target.w / 2) * scale;
+  const cy = (target.y + target.h / 2) * scale;
+  const x = Math.min(Math.max(0, Math.round(cx - w / 2)), Math.max(0, video.width - w));
+  const y = Math.min(Math.max(0, Math.round(cy - h / 2)), Math.max(0, video.height - h));
+  return { w, h, x, y };
+}
+
+/**
+ * The zoom at which `target` fills `fill` of the frame width, clamped so a
+ * punch never goes softer than it must nor tighter than is readable.
+ */
+function zoomFor(target: Target, scale: number, videoW: number, fill = 0.66, min = 1.7, max = 3.0): number {
+  const targetW = Math.max(1, target.w * scale);
+  return Math.min(max, Math.max(min, videoW / (targetW / fill)));
+}
+
+// ── Timeline construction ──────────────────────────────────────────────────
+
+/**
+ * Cut a shot's hold into wide/punch pieces.
+ *
+ * The source cursor advances continuously across every piece, so cutting to a
+ * punch and back reads as one take with the framing changed — not as a jump to
+ * a different moment. Ken Burns progresses across the whole section for the
+ * same reason: the zoom the wide frame returns to is the zoom it would have
+ * reached had the punch never happened.
+ */
+function buildPieces(
+  opts: {
+    holdStartS: number;
+    sectionDurS: number;
+    kb: boolean;
+    /** Absolute-in-section times, ascending, with their crops and hold lengths. */
+    punches: Array<{ atS: number; durS: number; crop: Crop; label: string }>;
+  },
+): Piece[] {
+  const { holdStartS, sectionDurS, kb, punches } = opts;
+  const pieces: Piece[] = [];
+  let cursor = 0; // seconds into the section
+
+  const kbAt = (t: number): number => KB_FROM + (KB_TO - KB_FROM) * Math.min(1, Math.max(0, t / sectionDurS));
+
+  for (const p of punches.sort((a, b) => a.atS - b.atS)) {
+    const at = Math.max(cursor, p.atS);
+    if (at >= sectionDurS) break;
+    if (at > cursor) {
+      pieces.push({
+        srcStartS: holdStartS + cursor,
+        durS: at - cursor,
+        kb: kb ? { from: kbAt(cursor), to: kbAt(at) } : undefined,
+        label: "wide",
+      });
+    }
+    const dur = Math.min(p.durS, sectionDurS - at);
+    if (dur <= 0.05) break;
+    pieces.push({ srcStartS: holdStartS + at, durS: dur, crop: p.crop, label: p.label });
+    cursor = at + dur;
+  }
+
+  if (cursor < sectionDurS) {
+    pieces.push({
+      srcStartS: holdStartS + cursor,
+      durS: sectionDurS - cursor,
+      kb: kb ? { from: kbAt(cursor), to: kbAt(sectionDurS) } : undefined,
+      label: "wide",
+    });
+  }
+  return pieces;
+}
+
+// ── Rendering ──────────────────────────────────────────────────────────────
+
+function pieceFilter(piece: Piece): string {
+  const parts: string[] = [`fps=${FPS}`];
+  /*
+   * A crop and a Ken Burns move can now coexist. The film never combines them
+   * (its punch-ins are static by rule), but an EDL crops every piece down to the
+   * recording's content rect first, and a wide piece still has to breathe.
+   */
+  if (piece.crop && piece.kb) {
+    const { w, h, x, y } = piece.crop;
+    const frames = Math.max(2, Math.round(piece.durS * FPS));
+    const { from, to } = piece.kb;
+    const z = `min(${from.toFixed(5)}+${(to - from).toFixed(6)}*on/${frames - 1}\\,${to.toFixed(5)})`;
+    parts.push(
+      `crop=${w}:${h}:${x}:${y}`,
+      `zoompan=z='${z}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${W}x${H}`,
+    );
+  } else if (piece.crop) {
+    const { w, h, x, y } = piece.crop;
+    parts.push(`crop=${w}:${h}:${x}:${y}`, `scale=${W}:${H}:flags=lanczos`);
+  } else if (piece.kb) {
+    const frames = Math.max(2, Math.round(piece.durS * FPS));
+    const { from, to } = piece.kb;
+    const z = `min(${from.toFixed(5)}+${(to - from).toFixed(6)}*on/${frames - 1}\\,${to.toFixed(5)})`;
+    parts.push(
+      `zoompan=z='${z}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${W}x${H}`,
+    );
+  } else {
+    parts.push(`scale=${W}:${H}:flags=lanczos`);
+  }
+  parts.push("format=yuv420p");
+  return parts.join(",");
+}
+
+async function renderPiece(piece: Piece, out: string): Promise<void> {
+  await ffmpeg([
+    "-ss", piece.srcStartS.toFixed(3),
+    "-i", RAW,
+    "-t", piece.durS.toFixed(3),
+    "-an",
+    "-vf", pieceFilter(piece),
+    "-c:v", "libx264", "-preset", "medium", "-crf", "17",
+    "-r", String(FPS),
+    out,
+  ]);
+}
+
+/** drawtext gets its copy via textfile, so nothing has to be shell-escaped. */
+async function renderCard(
+  block: Extract<Block, { kind: "card" }>,
+  index: number,
+  fontFile: string,
+): Promise<string> {
+  const out = join(WORK, `c${String(index).padStart(2, "0")}.mp4`);
+  const draws: string[] = [];
+
+  for (const [i, line] of block.lines.entries()) {
+    const txtPath = join(WORK, `card${index}_${i}.txt`);
+    await writeFile(txtPath, line.text, "utf8");
+    const opts = [
+      `textfile=${rel(txtPath)}`,
+      `fontfile=${filterPath(fontFile)}`,
+      `fontcolor=white`,
+      `fontsize=${line.size}`,
+      `x=(w-text_w)/2`,
+      `y=(h-text_h)/2+${line.dy}`,
+    ];
+    if (line.tracking) opts.push(`expansion=none`);
+    draws.push(`drawtext=${opts.join(":")}`);
+  }
+
+  /*
+   * The 2.39:1 letterbox on a black card is invisible as bars — it is rendered
+   * as a pair of hairlines at the frame lines instead, which is what actually
+   * reads as cinematic framing rather than as nothing at all.
+   */
+  if (block.letterbox) {
+    const bar = Math.round((H - W / 2.39) / 2);
+    draws.push(
+      `drawbox=x=0:y=${bar}:w=${W}:h=1:color=white@0.10:t=fill`,
+      `drawbox=x=0:y=${H - bar}:w=${W}:h=1:color=white@0.10:t=fill`,
+    );
+  }
+
+  const chain = [`format=yuv420p`, ...draws];
+  if (block.fadeOut) chain.push(`fade=t=out:st=${(block.durS - 1.0).toFixed(2)}:d=1.0`);
+
+  await ffmpeg([
+    "-f", "lavfi",
+    "-i", `color=c=black:s=${W}x${H}:r=${FPS}:d=${block.durS.toFixed(3)}`,
+    "-vf", chain.join(","),
+    "-c:v", "libx264", "-preset", "medium", "-crf", "17",
+    "-r", String(FPS),
+    out,
+  ]);
+  return out;
+}
+
+async function renderBlack(durS: number, index: number): Promise<string> {
+  const out = join(WORK, `b${String(index).padStart(2, "0")}.mp4`);
+  await ffmpeg([
+    "-f", "lavfi",
+    "-i", `color=c=black:s=${W}x${H}:r=${FPS}:d=${durS.toFixed(3)}`,
+    "-vf", "format=yuv420p",
+    "-c:v", "libx264", "-preset", "medium", "-crf", "17",
+    "-r", String(FPS),
+    out,
+  ]);
+  return out;
+}
+
+/** A low percussive hit: a short, fast-decaying sub tone with a soft transient. */
+async function renderHit(out: string): Promise<void> {
+  await ffmpeg([
+    "-f", "lavfi", "-i", "sine=frequency=58:duration=0.55:sample_rate=48000",
+    "-f", "lavfi", "-i", "anoisesrc=d=0.55:c=brown:r=48000:a=0.35",
+    "-filter_complex",
+    "[0:a]afade=t=out:st=0.04:d=0.5:curve=exp[s];" +
+      "[1:a]lowpass=f=220,afade=t=out:st=0:d=0.10[n];" +
+      "[s][n]amix=inputs=2:normalize=0,alimiter=limit=0.9,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a]",
+    "-map", "[a]", "-c:a", "pcm_s16le", out,
+  ]);
+}
+
+/** A non-melodic sub bed: two detuned low sines under filtered brown noise. */
+async function renderBed(durS: number, out: string): Promise<void> {
+  const d = durS.toFixed(3);
+  await ffmpeg([
+    "-f", "lavfi", "-i", `sine=frequency=47:duration=${d}:sample_rate=48000`,
+    "-f", "lavfi", "-i", `sine=frequency=47.6:duration=${d}:sample_rate=48000`,
+    "-f", "lavfi", "-i", `anoisesrc=d=${d}:c=brown:r=48000:a=0.5`,
+    "-filter_complex",
+    "[0:a]volume=0.5[a];[1:a]volume=0.38[b];[2:a]lowpass=f=140,volume=0.6[c];" +
+      "[a][b][c]amix=inputs=3:normalize=0,lowpass=f=320," +
+      "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[out]",
+    "-map", "[out]", "-t", d, "-c:a", "pcm_s16le", out,
+  ]);
+}
+
+async function ensureFont(): Promise<string> {
+  if (await exists(FONT_FILE)) return FONT_FILE;
+  await mkdir(ASSETS, { recursive: true });
+  try {
+    const res = await fetch(FONT_URL);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    await writeFile(FONT_FILE, Buffer.from(await res.arrayBuffer()));
+    console.log(`  fetched Instrument Serif → ${rel(FONT_FILE)}`);
+    return FONT_FILE;
+  } catch (err) {
+    if (await exists(FONT_FALLBACK)) {
+      console.warn(
+        `  ! Instrument Serif unavailable (${(err as Error).message}); cards fall back to Georgia.\n` +
+          `    The site's display face is Instrument Serif — drop the TTF at ${rel(FONT_FILE)} to match.`,
+      );
+      return FONT_FALLBACK;
+    }
+    throw new Error(`no title-card font available: ${(err as Error).message}`);
+  }
+}
+
+// ── EDL path (--edl) ───────────────────────────────────────────────────────
+
+/*
+ * A declarative edit list, used for demo/trailer.md.
+ *
+ * The film's timeline is authored in code above because it is narration-driven:
+ * every cut is positioned off a word-accurate VO cue. The trailer has no such
+ * spine — it is picture and cards on fixed durations — so it is described as
+ * data instead, and this interpreter lowers that data onto the SAME render
+ * primitives the film uses. Nothing above this comment changed behaviour.
+ *
+ * Honesty rules carried over verbatim:
+ *   - No crop is authored in the EDL. Every crop names a target MEASURED during
+ *     capture, and the geometry comes from marks.json through cropAt/zoomFor.
+ *   - Tokens resolve from marks.json evidence. An unresolvable token fails the
+ *     build rather than rendering a placeholder or a stale literal.
+ *   - A real wait is expressed by anchoring a clip's END to the evidence ms at
+ *     which the row became visible, so the latency ahead of it survives intact.
+ */
+
+interface EdlCrop {
+  target: string;
+  zoom?: number;
+  /** Force one crop size across a match-cut pair: the tighter of the two wins. */
+  matchZoomWith?: string;
+  fill?: number;
+  min?: number;
+  max?: number;
+}
+
+type EdlBlock =
+  | { type: "black"; dur: number; id?: string; label?: string }
+  | {
+      type: "card";
+      dur: number;
+      id?: string;
+      label?: string;
+      letterbox?: boolean;
+      fadeOut?: boolean;
+      lines: CardLine[];
+    }
+  | {
+      type: "clip";
+      id?: string;
+      label?: string;
+      shot: string;
+      /** "holdStart", "holdStart+2.5", "<target>.atMs", or a literal second. */
+      seek?: string | number;
+      /** Anchor the clip's END to an evidence timestamp, preserving the run-up. */
+      endAtEvidenceMs?: string;
+      dur: number;
+      crop?: EdlCrop;
+      kb?: [number, number];
+      freeze?: boolean;
+    };
+
+interface Edl {
+  source?: string;
+  marks?: string;
+  out?: string;
+  fps?: number;
+  letterbox?: number;
+  audio?: {
+    bedLevelDb?: number;
+    hitLevelDb?: number;
+    /** `toId` omitted means "to the last frame". */
+    bedSegments?: Array<{ fromId: string; toId?: string }>;
+    ticks?: { fromId: string; toId: string; levelDb?: number; periodS?: number };
+    /** A bare id uses the default level; `{id, levelDb}` overrides it. */
+    impacts?: Array<string | { id: string; levelDb?: number }>;
+    silence?: { fromId: string; toId: string };
+  };
+  blocks: EdlBlock[];
+}
+
+/** A short, dry clock tick: a filtered click with no tail. */
+async function renderTick(out: string): Promise<void> {
+  await ffmpeg([
+    "-f", "lavfi", "-i", "sine=frequency=1650:duration=0.05:sample_rate=48000",
+    "-f", "lavfi", "-i", "anoisesrc=d=0.05:c=white:r=48000:a=0.30",
+    "-filter_complex",
+    "[0:a]afade=t=out:st=0:d=0.05:curve=exp[s];" +
+      "[1:a]highpass=f=900,afade=t=out:st=0:d=0.035[n];" +
+      "[s][n]amix=inputs=2:normalize=0,alimiter=limit=0.8," +
+      "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a]",
+    "-map", "[a]", "-c:a", "pcm_s16le", out,
+  ]);
+}
+
+/**
+ * Where the page actually is inside the recording.
+ *
+ * A capture can request a 3840x2160 video and still paint the page at CSS 1:1 in
+ * the top-left, leaving the rest as uniform grey padding. Trusting
+ * `deviceScaleFactor` in that case sends every crop into the padding, so the
+ * rect is MEASURED off a real frame instead of assumed — same principle as the
+ * rest of this script: geometry is observed, never authored.
+ *
+ * Detection is by exclusion: the padding is one flat value, so the content is
+ * whatever is not that value.
+ */
+async function detectContentRect(
+  atS: number,
+  frame: { width: number; height: number },
+): Promise<{ x: number; y: number; w: number; h: number }> {
+  const { stdout } = await promisify(execFile)(
+    "ffmpeg",
+    [
+      "-hide_banner", "-loglevel", "error",
+      "-ss", atS.toFixed(3), "-i", RAW,
+      "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-",
+    ],
+    { maxBuffer: 256 * 1024 * 1024, encoding: "buffer" },
+  );
+  const buf = stdout as unknown as Buffer;
+  const { width: fw, height: fh } = frame;
+  if (buf.length < fw * fh) throw new Error("could not read a frame to measure the content rect");
+
+  // The padding value, sampled from the far corner — the one place content never reaches.
+  const padV = buf[(fh - 1) * fw + (fw - 1)];
+  const isContent = (x: number, y: number): boolean => Math.abs(buf[y * fw + x] - padV) > 6;
+
+  let maxX = 0;
+  let maxY = 0;
+  let minX = fw - 1;
+  let minY = fh - 1;
+  const STEP = 4;
+  for (let x = 0; x < fw; x += 1) {
+    for (let y = 0; y < fh; y += STEP) {
+      if (isContent(x, y)) {
+        if (x > maxX) maxX = x;
+        if (x < minX) minX = x;
+        break;
+      }
+    }
+  }
+  for (let y = 0; y < fh; y += 1) {
+    for (let x = 0; x < fw; x += STEP) {
+      if (isContent(x, y)) {
+        if (y > maxY) maxY = y;
+        if (y < minY) minY = y;
+        break;
+      }
+    }
+  }
+  if (maxX <= minX || maxY <= minY) return { x: 0, y: 0, w: fw, h: fh };
+  return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+}
+
+/** A held frame: one source frame, stilled for `durS`. No motion whatsoever. */
+async function renderFreeze(srcStartS: number, durS: number, crop: Crop | undefined, out: string): Promise<void> {
+  const still = out.replace(/\.mp4$/, ".png");
+  await ffmpeg(["-ss", srcStartS.toFixed(3), "-i", RAW, "-frames:v", "1", still]);
+  const chain = crop
+    ? `crop=${crop.w}:${crop.h}:${crop.x}:${crop.y},scale=${W}:${H}:flags=lanczos,format=yuv420p`
+    : `scale=${W}:${H}:flags=lanczos,format=yuv420p`;
+  await ffmpeg([
+    "-loop", "1", "-i", rel(still), "-t", durS.toFixed(3),
+    "-vf", chain, "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-r", String(FPS),
+    out,
+  ]);
+}
+
+async function buildFromEdl(edlPath: string): Promise<void> {
+  const edl = JSON.parse(await readFile(edlPath, "utf8")) as Edl;
+  await mkdir(WORK, { recursive: true });
+
+  if (edl.source) RAW = join(process.cwd(), edl.source);
+  if (edl.out) FINAL = join(process.cwd(), edl.out);
+  if (!(await exists(RAW))) throw new Error(`EDL source not found: ${rel(RAW)}`);
+
+  const marksPath = edl.marks ? join(process.cwd(), edl.marks) : join(CAP, "marks.json");
+  const marks = JSON.parse(await readFile(marksPath, "utf8")) as MarksFile;
+  const captureDur = await probeDuration(RAW);
+  const video = marks.videoSize ?? { width: W, height: H };
+  const pad = marks.padSeconds;
+  const font = await ensureFont();
+  const byShot = new Map(marks.marks.map((m) => [m.shot, m]));
+
+  if (video.width !== 0 && Math.abs(video.width - (await sourceWidth())) > 1) {
+    throw new Error(
+      `EDL source is not the capture marks.json describes ` +
+        `(source ${await sourceWidth()}px wide, marks say ${video.width}px). ` +
+        `Every crop below is measured against the marked capture — point --edl at that file.`,
+    );
+  }
+
+  async function sourceWidth(): Promise<number> {
+    const { stdout } = await run("ffprobe", [
+      "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width",
+      "-of", "default=noprint_wrappers=1:nokey=1", RAW,
+    ]);
+    return Number(stdout.trim());
+  }
+
+  /*
+   * Measure the page inside the recording, then derive the scale from what was
+   * actually painted rather than from what the capture asked for. `content` is
+   * the frame every crop below is expressed in.
+   */
+  const probeAtS = Math.min(
+    captureDur - 0.1,
+    Math.min(marks.marks[0].endMs / 1000, captureDur) - (marks.marks[0].specHoldS + pad) + 1,
+  );
+  const content = await detectContentRect(Math.max(0, probeAtS), video);
+  const scale = content.w / (marks.viewport?.width ?? W);
+  const declared = marks.deviceScaleFactor ?? 1;
+
+  console.log(
+    `  content rect ${content.w}x${content.h} at (${content.x},${content.y}) · ` +
+      `effective scale ${scale.toFixed(2)}${Math.abs(scale - declared) > 0.01 ? ` (marks.json declares ${declared})` : ""}`,
+  );
+  if (content.w < W * 2) {
+    console.warn(
+      `  ! the page was painted ${content.w}px wide, so punch-ins are UPSCALES, not true crops.\n` +
+        `    Re-capture with the page actually rendered at deviceScaleFactor ${declared} for true 4K punch-ins.`,
+    );
+  }
+
+  const holdStartOf = (shot: string): number => {
+    const m = byShot.get(shot);
+    if (!m) throw new Error(`EDL references shot "${shot}", which the capture never marked`);
+    return Math.min(m.endMs / 1000, captureDur) - (m.specHoldS + pad);
+  };
+  const tgt = (shot: string, name: string): Target => {
+    const t = marks.targets?.[shot]?.[name];
+    if (!t) throw new Error(`EDL crop wants target "${shot}.${name}" — the capture never measured it`);
+    return t;
+  };
+
+  /** Tokens come from evidence.countersAtEnd; an unknown token fails the build. */
+  const counters = (marks.evidence.countersAtEnd ?? {}) as Record<string, string>;
+  const TOKENS: Record<string, string | undefined> = {
+    settledAfter: counters["Settled onchain"],
+    reconciledAfter: counters["Attempts reconciled"],
+    discrepanciesAfter: counters["Discrepancies caught"],
+  };
+  const resolveTokens = (text: string): string =>
+    text.replace(/\{\{(\w+)\}\}/g, (_m, key: string) => {
+      const v = TOKENS[key];
+      if (v === undefined || v === "") {
+        throw new Error(
+          `trailer token {{${key}}} does not resolve from ${rel(marksPath)} — ` +
+            `re-capture rather than typing the number in.`,
+        );
+      }
+      return v;
+    });
+
+  const seekOf = (b: Extract<EdlBlock, { type: "clip" }>): number => {
+    if (b.endAtEvidenceMs) {
+      const ms = marks.evidence[b.endAtEvidenceMs] as number | undefined;
+      if (ms === undefined) throw new Error(`EDL wants evidence."${b.endAtEvidenceMs}", which the capture never recorded`);
+      return Math.max(0, ms / 1000 - b.dur);
+    }
+    const s = b.seek ?? "holdStart";
+    if (typeof s === "number") return s;
+    const m = /^holdStart(?:\s*\+\s*([\d.]+))?$/.exec(s);
+    if (m) return holdStartOf(b.shot) + (m[1] ? Number(m[1]) : 0);
+    const at = /^(\w+)\.atMs$/.exec(s);
+    if (at) return tgt(b.shot, at[1]).atMs / 1000;
+    const n = Number(s);
+    if (!Number.isNaN(n)) return n;
+    throw new Error(`EDL clip on "${b.shot}" has an unparseable seek: ${String(s)}`);
+  };
+
+  /**
+   * Every piece is cropped, because the recording's padding must never reach the
+   * output. A wide piece crops to the content rect exactly; a punch crops inside
+   * it and is then offset back into source coordinates.
+   */
+  const contentFrame = { width: content.w, height: content.h };
+  const cropOf = (b: Extract<EdlBlock, { type: "clip" }>): Crop => {
+    if (!b.crop) return { w: content.w, h: content.h, x: content.x, y: content.y };
+    const c = b.crop;
+    const primary = tgt(b.shot, c.target);
+    let zoom: number;
+    if (c.zoom !== undefined) {
+      zoom = c.zoom;
+    } else {
+      const fill = c.fill ?? 0.66;
+      const min = c.min ?? 1.7;
+      const max = c.max ?? 3.0;
+      zoom = zoomFor(primary, scale, contentFrame.width, fill, min, max);
+      if (c.matchZoomWith) {
+        // Identical framing on both halves of a match cut: take the tighter zoom.
+        zoom = Math.min(zoom, zoomFor(tgt(b.shot, c.matchZoomWith), scale, contentFrame.width, fill, min, max));
+      }
+    }
+    const r = cropAt(primary, zoom, scale, contentFrame);
+    return { ...r, x: r.x + content.x, y: r.y + content.y };
+  };
+
+  // ── Plan ─────────────────────────────────────────────────────────────────
+  const starts: number[] = [];
+  let clock = 0;
+  for (const b of edl.blocks) {
+    starts.push(clock);
+    clock += b.dur;
+  }
+  const totalS = clock;
+  const mmss = (s: number): string => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+  const atId = (id: string): number => {
+    const i = edl.blocks.findIndex((b) => b.id === id);
+    if (i < 0) throw new Error(`EDL audio references id "${id}", which no block declares`);
+    return starts[i];
+  };
+
+  console.log(`\n  ${rel(edlPath)} → ${rel(FINAL)}`);
+  console.log(`  source ${rel(RAW)} (${video.width}x${video.height}, ${captureDur.toFixed(1)}s)\n`);
+  console.log("  block                       start      dur   detail");
+  console.log("  " + "─".repeat(88));
+  for (const [i, b] of edl.blocks.entries()) {
+    const detail =
+      b.type === "clip"
+        ? `${b.shot} @${seekOf(b).toFixed(1)}s` +
+          (b.crop ? ` · crop ${b.crop.target}` : b.freeze ? " · frozen" : b.kb ? " · ken burns" : " · wide")
+        : b.type === "card"
+          ? resolveTokens(b.lines[0].text).slice(0, 44)
+          : "";
+    console.log(
+      `  ${(b.label ?? b.type).padEnd(26)} ${starts[i].toFixed(1).padStart(6)}s ${b.dur.toFixed(1).padStart(6)}s   ${detail}`,
+    );
+  }
+  console.log("  " + "─".repeat(88));
+  console.log(`  total ${totalS.toFixed(1)}s (${mmss(totalS)})\n`);
+
+  // ── Video ────────────────────────────────────────────────────────────────
+  console.log("  rendering video…");
+  const parts: string[] = [];
+  for (const [i, b] of edl.blocks.entries()) {
+    const stem = String(i).padStart(2, "0");
+    if (b.type === "black") {
+      parts.push(await renderBlack(b.dur, i));
+    } else if (b.type === "card") {
+      const lines = b.lines.map((l) => ({ ...l, text: resolveTokens(l.text) }));
+      parts.push(
+        await renderCard(
+          { kind: "card", durS: b.dur, label: b.label ?? "card", lines, letterbox: b.letterbox ?? true, fadeOut: b.fadeOut },
+          i,
+          font,
+        ),
+      );
+    } else {
+      const out = join(WORK, `t${stem}.mp4`);
+      const srcStartS = seekOf(b);
+      const crop = cropOf(b);
+      if (srcStartS < 0 || srcStartS + b.dur > captureDur + 0.05) {
+        throw new Error(
+          `EDL clip "${b.label ?? b.shot}" wants ${srcStartS.toFixed(1)}–${(srcStartS + b.dur).toFixed(1)}s ` +
+            `of a ${captureDur.toFixed(1)}s capture.`,
+        );
+      }
+      if (b.freeze) await renderFreeze(srcStartS, b.dur, crop, out);
+      else
+        await renderPiece(
+          { srcStartS, durS: b.dur, crop, kb: b.kb ? { from: b.kb[0], to: b.kb[1] } : undefined, label: b.label ?? b.shot },
+          out,
+        );
+      parts.push(out);
+    }
+  }
+
+  const listFile = join(WORK, "concat-edl.txt");
+  await writeFile(listFile, parts.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"));
+  const videoOnly = join(WORK, "trailer-video.mp4");
+  await ffmpeg(["-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", videoOnly]);
+
+  // ── Audio: bed segments, ticks, impacts, and one true silence ────────────
+  console.log("  building audio…");
+  const a = edl.audio ?? {};
+  const bedDb = a.bedLevelDb ?? BED_DB;
+  const hitDb = a.hitLevelDb ?? HIT_DB;
+  const hitFile = join(WORK, "t-hit.wav");
+  const tickFile = join(WORK, "t-tick.wav");
+  await renderHit(hitFile);
+  await renderTick(tickFile);
+
+  const inputs: string[] = [];
+  const filters: string[] = [];
+  const mix: string[] = [];
+  let idx = 0;
+
+  /*
+   * The bed is cut into segments rather than faded, because the script asks for
+   * TRUE silence at 00:59.5 — "not a dip, zero". A fade would leave a tail
+   * under the black, which is exactly the beat the trailer is built around.
+   */
+  for (const seg of a.bedSegments ?? []) {
+    const fromS = atId(seg.fromId);
+    const toS = seg.toId ? atId(seg.toId) : totalS;
+    const durS = Math.max(0.1, toS - fromS);
+    const bedSeg = join(WORK, `t-bed${idx}.wav`);
+    await renderBed(durS, bedSeg);
+    const at = Math.round(fromS * 1000);
+    inputs.push("-i", bedSeg);
+    filters.push(
+      `[${idx}:a]volume=${bedDb}dB,afade=t=in:st=0:d=1.5,` +
+        `afade=t=out:st=${Math.max(0, durS - 1.2).toFixed(2)}:d=1.2,adelay=${at}|${at}[b${idx}]`,
+    );
+    mix.push(`[b${idx}]`);
+    idx++;
+  }
+
+  if (a.ticks) {
+    const fromS = atId(a.ticks.fromId);
+    const toS = atId(a.ticks.toId);
+    const period = a.ticks.periodS ?? 1.0;
+    const level = a.ticks.levelDb ?? -20;
+    // Ticks stop dead on the match cut and never return.
+    for (let t = fromS; t < toS - 0.05; t += period) {
+      const at = Math.round(t * 1000);
+      inputs.push("-i", tickFile);
+      filters.push(`[${idx}:a]volume=${level}dB,adelay=${at}|${at}[k${idx}]`);
+      mix.push(`[k${idx}]`);
+      idx++;
+    }
+  }
+
+  for (const imp of a.impacts ?? []) {
+    const id = typeof imp === "string" ? imp : imp.id;
+    const db = typeof imp === "string" ? hitDb : (imp.levelDb ?? hitDb);
+    const at = Math.round(atId(id) * 1000);
+    inputs.push("-i", hitFile);
+    filters.push(`[${idx}:a]volume=${db}dB,adelay=${at}|${at}[h${idx}]`);
+    mix.push(`[h${idx}]`);
+    idx++;
+  }
+
+  if (mix.length === 0) throw new Error("EDL declares no audio — a silent trailer is not a deliverable");
+
+  const sil = a.silence ? { from: atId(a.silence.fromId), to: atId(a.silence.toId) } : undefined;
+  const chain = [
+    `${mix.join("")}amix=inputs=${mix.length}:normalize=0:dropout_transition=0`,
+  ];
+  if (sil) {
+    /*
+     * Hard-gate the silence window to zero — a fade would leave a tail under the
+     * black, and the script asks for zero, not a dip.
+     *
+     * The window closes a frame EARLY on purpose. An impact landing on the block
+     * that ends the silence starts at exactly `to`, and an inclusive bound
+     * flattens its attack — which is how the biggest hit in the trailer ends up
+     * the quietest.
+     */
+    const guard = Math.max(sil.from, sil.to - 1 / FPS);
+    chain.push(`volume=enable='between(t,${sil.from.toFixed(3)},${guard.toFixed(3)})':volume=0`);
+  }
+  chain.push(
+    `apad=whole_dur=${totalS.toFixed(3)}`,
+    `atrim=0:${totalS.toFixed(3)}`,
+    `alimiter=limit=0.95`,
+    `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo`,
+  );
+  filters.push(`${chain.join(",")}[mixout]`);
+
+  const audioOnly = join(WORK, "trailer-audio.m4a");
+  await ffmpeg([
+    ...inputs,
+    "-filter_complex", filters.join(";"),
+    "-map", "[mixout]",
+    "-t", totalS.toFixed(3),
+    "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+    audioOnly,
+  ]);
+  console.log(
+    `  bed ${bedDb}dB ×${(a.bedSegments ?? []).length} · impacts ${
+      (a.impacts ?? [])
+        .map((i) => (typeof i === "string" ? `${i}@${hitDb}dB` : `${i.id}@${i.levelDb ?? hitDb}dB`))
+        .join(", ") || "none"
+    }` +
+      (sil ? ` · true silence ${sil.from.toFixed(1)}–${sil.to.toFixed(1)}s` : ""),
+  );
+
+  // ── Mux ──────────────────────────────────────────────────────────────────
+  console.log("  muxing…");
+  await ffmpeg([
+    "-i", videoOnly,
+    "-i", audioOnly,
+    "-map", "0:v:0", "-map", "1:a:0",
+    "-c:v", "libx264", "-preset", "slow", "-crf", "20",
+    "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "192k",
+    "-movflags", "+faststart",
+    "-shortest",
+    FINAL,
+  ]);
+
+  await rm(WORK, { recursive: true, force: true });
+
+  const finalDur = await probeDuration(FINAL);
+  const { stdout: sizeOut } = await run("ffprobe", [
+    "-v", "error", "-show_entries", "format=size",
+    "-of", "default=noprint_wrappers=1:nokey=1", FINAL,
+  ]);
+  const mb = Number(sizeOut.trim()) / 1_048_576;
+  console.log(`\n  ${FINAL}`);
+  console.log(`  ${mmss(finalDur)}  ·  ${mb.toFixed(1)} MB  ·  H.264 ${W}x${H} ${FPS}fps\n`);
+}
+
+// ── EDL path (the trailer) ─────────────────────────────────────────────────
+
+/*
+ * A second, narrower entry point: `--edl demo/trailer.edl.json`.
+ *
+ * The film above is a hand-built timeline whose shape is argued for in
+ * demo/script.md. The trailer is a different piece cut from the same tape, so
+ * it gets a declarative EDL rather than a second hardcoded timeline — but it
+ * reuses the film's primitives (crop geometry, card rendering, hit/bed
+ * synthesis) so both pieces stay honest in the same way.
+ *
+ * What this path does NOT do is touch main(). The film builds exactly as it did.
+ */
+
+interface EdlCropRef {
+  shot: string;
+  name: string;
+  /** Compose a cell the capture never measured, from measurements it did. */
+  column?: { shot: string; name: string; row?: string };
+  /** Explicit zoom as a ratio of frame width (a ratio, not a rectangle). */
+  zoom?: number;
+  /** Force one crop size across several targets — the match cut. */
+  zoomMatch?: Array<{ shot: string; name: string }>;
+  fill?: number;
+  min?: number;
+  max?: number;
+}
+
+type EdlBlock =
+  | { kind: "black"; durS: number; label: string }
+  | { kind: "card"; durS: number; label: string; lines: CardLine[]; fadeOut?: boolean; impact?: number }
+  | { kind: "clip"; label: string; srcStartS: number; durS: number; kb?: [number, number]; crop?: EdlCropRef; impact?: number }
+  | { kind: "freeze"; label: string; srcAtS: number; durS: number; impact?: number };
+
+interface Edl {
+  title: string;
+  source: string;
+  marks: string;
+  output: string;
+  width: number;
+  height: number;
+  fps: number;
+  aspect: number;
+  targetS: number;
+  hardCapS: number;
+  blocks: EdlBlock[];
+  audio: {
+    bed: { db: number; windows: Array<[number, number]>; fadeInS: number; fadeOutS: number };
+    ticks: { db: number; fromS: number; toS: number; periodS: number };
+    impactDb: number;
+    silence: [number, number];
+  };
+}
+
+/** A clock tick: a short filtered click that decays immediately. */
+async function renderTick(out: string, periodS: number): Promise<void> {
+  await ffmpeg([
+    "-f", "lavfi", "-i", `sine=frequency=2100:duration=0.012:sample_rate=48000`,
+    "-f", "lavfi", "-i", `anoisesrc=d=0.012:c=white:r=48000:a=0.6`,
+    "-filter_complex",
+    "[0:a]volume=0.7[s];[1:a]highpass=f=1200,volume=0.5[n];" +
+      `[s][n]amix=inputs=2:normalize=0,afade=t=out:st=0:d=0.012,` +
+      `apad=whole_dur=${periodS.toFixed(3)},` +
+      "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a]",
+    "-map", "[a]", "-t", periodS.toFixed(3), "-c:a", "pcm_s16le", out,
+  ]);
+}
+
+/**
+ * A 2.39:1 crop in source pixels, centred on a target.
+ *
+ * Same contract as cropAt: clamping shifts the rect rather than shrinking it,
+ * so a match-cut pair keeps identical framing even at the frame edge.
+ */
+function cropWide(
+  target: { x: number; y: number; w: number; h: number } | null,
+  zoom: number,
+  scale: number,
+  video: { width: number; height: number },
+  aspect: number,
+): Crop {
+  const w = Math.min(video.width, Math.round(video.width / zoom / 2) * 2);
+  const h = Math.min(video.height, Math.round(w / aspect / 2) * 2);
+  const cx = target ? (target.x + target.w / 2) * scale : video.width / 2;
+  const cy = target ? (target.y + target.h / 2) * scale : video.height / 2;
+  const x = Math.min(Math.max(0, Math.round(cx - w / 2)), Math.max(0, video.width - w));
+  const y = Math.min(Math.max(0, Math.round(cy - h / 2)), Math.max(0, video.height - h));
+  return { w, h, x, y };
+}
+
+async function assembleFromEdl(edlPath: string): Promise<void> {
+  const edl = JSON.parse(await readFile(edlPath, "utf8")) as Edl;
+  const marks = JSON.parse(await readFile(join(process.cwd(), edl.marks), "utf8")) as MarksFile;
+  const src = join(process.cwd(), edl.source);
+  const out = join(process.cwd(), edl.output);
+  const work = join(DEMO, "work-trailer");
+
+  if (!(await exists(src))) throw new Error(`EDL source missing: ${edl.source}`);
+  await rm(work, { recursive: true, force: true });
+  await mkdir(work, { recursive: true });
+
+  const scale = marks.deviceScaleFactor ?? 1;
+  const video = marks.videoSize;
+  const { width: W2, height: H2, fps, aspect } = edl;
+  /** The picture band inside the letterbox. */
+  const PH = Math.round(W2 / aspect / 2) * 2;
+  const BAR = Math.round((H2 - PH) / 2);
+  const font = await ensureFont();
+
+  const srcDur = await probeDuration(src);
+  if (video.width < W2 * 2) {
+    console.warn(`  ! source is ${video.width}x${video.height} — punch-ins would upscale.`);
+  }
+
+  // ── Token resolution: a figure is read off the capture or the build fails ──
+  const counters = marks.evidence.countersAtEnd as Record<string, string> | undefined;
+  const tokens: Record<string, string | undefined> = {
+    settledAfter: counters?.["Settled onchain"],
+    reconciledAfter: counters?.["Attempts reconciled"],
+    discrepanciesAfter: counters?.["Discrepancies caught"],
+  };
+  const resolve = (text: string): string =>
+    text.replace(/\{\{(\w+)\}\}/g, (_m, key: string) => {
+      const v = tokens[key];
+      if (v === undefined || v === "") {
+        throw new Error(
+          `trailer: token {{${key}}} does not resolve from ${edl.marks}. ` +
+            `The numbers policy forbids a fallback — re-capture rather than typing a figure.`,
+        );
+      }
+      return v;
+    });
+
+  // ── Crop resolution: every number measured, none authored ─────────────────
+  const tgt = (shot: string, name: string): Target => {
+    const t = marks.targets?.[shot]?.[name];
+    if (!t) throw new Error(`trailer: capture recorded no target "${shot}.${name}"`);
+    return t;
+  };
+
+  function resolveCrop(ref: EdlCropRef): Crop {
+    let base: { x: number; y: number; w: number; h: number } = tgt(ref.shot, ref.name);
+    if (ref.column) {
+      /*
+       * The capture measured this column on a different row. Take the column's
+       * x/w and its vertical offset within its own row, and apply both to the
+       * row that WAS measured here. Same table, same columns — so the result is
+       * composed entirely from measured geometry, not estimated from a frame.
+       */
+      const col = tgt(ref.column.shot, ref.column.name);
+      const colRow = tgt(ref.column.shot, ref.column.row ?? "row");
+      base = { x: col.x, y: base.y + (col.y - colRow.y), w: col.w, h: col.h };
+    }
+    let zoom: number;
+    if (ref.zoom !== undefined) {
+      zoom = ref.zoom;
+    } else if (ref.zoomMatch) {
+      zoom = Math.min(
+        ...ref.zoomMatch.map((m) =>
+          zoomFor(tgt(m.shot, m.name), scale, video.width, ref.fill, ref.min, ref.max),
+        ),
+      );
+    } else {
+      zoom = zoomFor(base as Target, scale, video.width, ref.fill, ref.min, ref.max);
+    }
+    return cropWide(base, zoom, scale, video, aspect);
+  }
+
+  // ── Plan ──────────────────────────────────────────────────────────────────
+  const starts: number[] = [];
+  let clock = 0;
+  for (const b of edl.blocks) {
+    starts.push(clock);
+    clock += b.durS;
+  }
+  const totalS = clock;
+  const mmss = (s: number): string => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+
+  console.log(`\n  ${edl.title}`);
+  console.log(`  source ${edl.source}  (${video.width}x${video.height}, ${srcDur.toFixed(1)}s)\n`);
+  console.log("  block                              start      dur   detail");
+  console.log("  " + "─".repeat(88));
+  for (const [i, b] of edl.blocks.entries()) {
+    let detail = "";
+    if (b.kind === "clip") {
+      detail = `src ${b.srcStartS.toFixed(2)}s` + (b.crop ? ` · punch ${b.crop.shot}.${b.crop.name}` : " · wide") + (b.kb ? ` · kb ${b.kb[0]}→${b.kb[1]}` : "");
+      const end = b.srcStartS + b.durS;
+      if (end > srcDur + 0.05) throw new Error(`block "${b.label}" runs to ${end.toFixed(2)}s, past the ${srcDur.toFixed(1)}s source`);
+    } else if (b.kind === "freeze") {
+      detail = `freeze @ ${b.srcAtS.toFixed(2)}s`;
+    } else if (b.kind === "card") {
+      detail = resolve(b.lines[0].text).slice(0, 40);
+    }
+    if (b.impact) detail += `  ◄ impact ${b.impact}`;
+    console.log(`  ${b.label.padEnd(33)} ${starts[i].toFixed(1).padStart(6)}s ${b.durS.toFixed(1).padStart(6)}s   ${detail}`);
+  }
+  console.log("  " + "─".repeat(88));
+  console.log(`  total ${totalS.toFixed(2)}s (${mmss(totalS)})   target ${mmss(edl.targetS)}   cap ${mmss(edl.hardCapS)}`);
+  if (totalS > edl.hardCapS) throw new Error(`${mmss(totalS)} exceeds the ${mmss(edl.hardCapS)} cap — cut picture, never audio.`);
+
+  // ── Render picture ────────────────────────────────────────────────────────
+  console.log("\n  rendering picture…");
+  const parts: string[] = [];
+
+  /** Every piece lands in the same letterboxed frame, whatever its source. */
+  const box = `scale=${W2}:${PH}:flags=lanczos,pad=${W2}:${H2}:0:${BAR}:black,format=yuv420p`;
+
+  for (const [i, b] of edl.blocks.entries()) {
+    const p = join(work, `p${String(i).padStart(3, "0")}.mp4`);
+
+    if (b.kind === "black") {
+      await ffmpeg([
+        "-f", "lavfi", "-i", `color=c=black:s=${W2}x${H2}:r=${fps}:d=${b.durS.toFixed(3)}`,
+        "-vf", "format=yuv420p",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-r", String(fps), p,
+      ]);
+    } else if (b.kind === "card") {
+      const draws: string[] = [];
+      for (const [li, line] of b.lines.entries()) {
+        const txtPath = join(work, `t${i}_${li}.txt`);
+        await writeFile(txtPath, resolve(line.text), "utf8");
+        draws.push(
+          `drawtext=textfile=${rel(txtPath)}:fontfile=${filterPath(font)}:fontcolor=white:` +
+            `fontsize=${line.size}:x=(w-text_w)/2:y=(h-text_h)/2+${line.dy}`,
+        );
+      }
+      // The letterbox reads as a pair of hairlines on a black card, not as bars.
+      draws.push(
+        `drawbox=x=0:y=${BAR}:w=${W2}:h=1:color=white@0.10:t=fill`,
+        `drawbox=x=0:y=${H2 - BAR}:w=${W2}:h=1:color=white@0.10:t=fill`,
+      );
+      const chain = ["format=yuv420p", ...draws];
+      if (b.fadeOut) chain.push(`fade=t=out:st=${(b.durS - 1.5).toFixed(2)}:d=1.5`);
+      await ffmpeg([
+        "-f", "lavfi", "-i", `color=c=black:s=${W2}x${H2}:r=${fps}:d=${b.durS.toFixed(3)}`,
+        "-vf", chain.join(","),
+        "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-r", String(fps), p,
+      ]);
+    } else if (b.kind === "freeze") {
+      const still = join(work, `s${i}.png`);
+      await ffmpeg(["-ss", b.srcAtS.toFixed(3), "-i", src, "-frames:v", "1", still]);
+      const c = cropWide(null, 1.0, scale, video, aspect);
+      await ffmpeg([
+        "-loop", "1", "-i", still, "-t", b.durS.toFixed(3),
+        "-vf", `crop=${c.w}:${c.h}:${c.x}:${c.y},${box}`,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-r", String(fps), p,
+      ]);
+    } else {
+      const c = b.crop ? resolveCrop(b.crop) : cropWide(null, 1.0, scale, video, aspect);
+      const chain: string[] = [`fps=${fps}`, `crop=${c.w}:${c.h}:${c.x}:${c.y}`];
+      if (b.kb) {
+        const frames = Math.max(2, Math.round(b.durS * fps));
+        const [from, to] = b.kb;
+        const z = `min(${from.toFixed(5)}+${(to - from).toFixed(6)}*on/${frames - 1}\\,${to.toFixed(5)})`;
+        chain.push(`zoompan=z='${z}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${W2}x${PH}`);
+        chain.push(`pad=${W2}:${H2}:0:${BAR}:black`, "format=yuv420p");
+      } else {
+        chain.push(box);
+      }
+      await ffmpeg([
+        "-ss", b.srcStartS.toFixed(3), "-i", src, "-t", b.durS.toFixed(3), "-an",
+        "-vf", chain.join(","),
+        "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-r", String(fps), p,
+      ]);
+    }
+    parts.push(p);
+  }
+
+  const listFile = join(work, "concat.txt");
+  await writeFile(listFile, parts.map((x) => `file '${x.replace(/\\/g, "/")}'`).join("\n"));
+  const videoOnly = join(work, "video.mp4");
+  await ffmpeg(["-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", videoOnly]);
+
+  // ── Sound: three impacts and one absence ──────────────────────────────────
+  console.log("  building sound…");
+  const bedFile = join(work, "bed.wav");
+  const hitFile = join(work, "hit.wav");
+  const tickFile = join(work, "tick.wav");
+  const maxBed = Math.max(...edl.audio.bed.windows.map(([a, z]) => z - a));
+  await renderBed(maxBed, bedFile);
+  await renderHit(hitFile);
+  await renderTick(tickFile, edl.audio.ticks.periodS);
+
+  // Impacts are read off the assembled timeline — picture can never desync them.
+  const impacts = edl.blocks
+    .map((b, i) => (b.impact ? starts[i] : null))
+    .filter((t): t is number => t !== null);
+
+  const inputs: string[] = [];
+  const filters: string[] = [];
+  const labels: string[] = [];
+  let idx = 0;
+
+  for (const [a, z] of edl.audio.bed.windows) {
+    const at = Math.round(a * 1000);
+    inputs.push("-i", bedFile);
+    filters.push(
+      `[${idx}:a]atrim=0:${(z - a).toFixed(3)},asetpts=PTS-STARTPTS,` +
+        `volume=${edl.audio.bed.db}dB,` +
+        `afade=t=in:st=0:d=${edl.audio.bed.fadeInS},` +
+        `afade=t=out:st=${Math.max(0, z - a - edl.audio.bed.fadeOutS).toFixed(2)}:d=${edl.audio.bed.fadeOutS},` +
+        `adelay=${at}|${at}[b${idx}]`,
+    );
+    labels.push(`[b${idx}]`);
+    idx++;
+  }
+
+  {
+    const { fromS, toS, periodS, db } = edl.audio.ticks;
+    const n = Math.max(1, Math.ceil((toS - fromS) / periodS));
+    const at = Math.round(fromS * 1000);
+    inputs.push("-stream_loop", String(n), "-i", tickFile);
+    filters.push(
+      `[${idx}:a]atrim=0:${(toS - fromS).toFixed(3)},asetpts=PTS-STARTPTS,` +
+        `volume=${db}dB,afade=t=in:st=0:d=1.5,adelay=${at}|${at}[tk]`,
+    );
+    labels.push("[tk]");
+    idx++;
+  }
+
+  for (const t of impacts) {
+    const at = Math.round(t * 1000);
+    inputs.push("-i", hitFile);
+    filters.push(`[${idx}:a]volume=${edl.audio.impactDb}dB,adelay=${at}|${at}[h${idx}]`);
+    labels.push(`[h${idx}]`);
+    idx++;
+  }
+
+  /*
+   * The two seconds of silence are enforced here rather than trusted to the
+   * bed windows: anything still ringing out — a tail, a hit's decay — is muted
+   * across the gap. It has to be zero, not quiet.
+   */
+  const [s0, s1] = edl.audio.silence;
+  filters.push(
+    `${labels.join("")}amix=inputs=${labels.length}:normalize=0:dropout_transition=0,` +
+      `volume=enable='between(t,${s0},${s1})':volume=0,` +
+      `apad=whole_dur=${totalS.toFixed(3)},alimiter=limit=0.95,` +
+      `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[mix]`,
+  );
+
+  const audioOnly = join(work, "audio.m4a");
+  await ffmpeg([
+    ...inputs, "-filter_complex", filters.join(";"), "-map", "[mix]",
+    "-t", totalS.toFixed(3), "-c:a", "aac", "-b:a", "192k", "-ac", "2", audioOnly,
+  ]);
+  console.log(`  bed ${edl.audio.bed.db}dB · ticks → ${edl.audio.ticks.toS.toFixed(1)}s · impacts at ${impacts.map((t) => t.toFixed(2)).join(", ")}s · silence ${s0}–${s1}s`);
+
+  console.log("  muxing…");
+  await ffmpeg([
+    "-i", videoOnly, "-i", audioOnly, "-map", "0:v:0", "-map", "1:a:0",
+    "-c:v", "libx264", "-preset", "slow", "-crf", "20",
+    "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-shortest", out,
+  ]);
+  await rm(work, { recursive: true, force: true });
+
+  const finalDur = await probeDuration(out);
+  const { stdout: sizeOut } = await run("ffprobe", [
+    "-v", "error", "-show_entries", "format=size",
+    "-of", "default=noprint_wrappers=1:nokey=1", out,
+  ]);
+  console.log(`\n  ${out}`);
+  console.log(`  ${mmss(finalDur)}  ·  ${(Number(sizeOut.trim()) / 1_048_576).toFixed(1)} MB  ·  H.264 ${W2}x${H2} ${fps}fps  ·  ${aspect}:1\n`);
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  const edlArg = process.argv.indexOf("--edl");
+  if (edlArg !== -1) {
+    const p = process.argv[edlArg + 1];
+    if (!p) throw new Error("--edl needs a path, e.g. --edl demo/trailer.edl.json");
+    return assembleFromEdl(join(process.cwd(), p));
+  }
+
+  await mkdir(WORK, { recursive: true });
+
+  const marks = JSON.parse(await readFile(join(CAP, "marks.json"), "utf8")) as MarksFile;
+  const vo = (JSON.parse(await readFile(join(VO, "manifest.json"), "utf8")) as VoEntry[]).sort(
+    (a, b) => a.index - b.index,
+  );
+  const captureDur = await probeDuration(RAW);
+  const scale = marks.deviceScaleFactor ?? 1;
+  const video = marks.videoSize ?? { width: W, height: H };
+  const pad = marks.padSeconds;
+  const font = await ensureFont();
+
+  if (video.width < W * 2) {
+    console.warn(
+      `  ! source is ${video.width}x${video.height}; punch-ins will be upscaled. ` +
+        `Re-capture at deviceScaleFactor 2 for true crops.`,
+    );
+  }
+
+  const byShot = new Map(marks.marks.map((m) => [m.shot, m]));
+  const byKey = new Map(vo.map((v) => [v.key, v]));
+  const tgt = (shot: string, name: string): Target => {
+    const t = marks.targets?.[shot]?.[name];
+    if (!t) throw new Error(`capture recorded no target "${shot}.${name}" — re-run scripts/capture-demo.ts`);
+    return t;
+  };
+  const voFor = (key: string): VoEntry => {
+    const v = byKey.get(key);
+    if (!v) throw new Error(`no narration rendered for shot "${key}" — run scripts/generate-vo.ts`);
+    return v;
+  };
+  const cue = (v: VoEntry, name: string): number => {
+    const c = v.cues?.[name];
+    if (c === undefined) throw new Error(`narration ${v.id} has no cue "${name}" — check CUES in generate-vo.ts`);
+    return c;
+  };
+
+  /**
+   * The lead-in for a shot containing an injection: a clipped approach, then
+   * every frame from the click to the row appearing.
+   *
+   * Returns where the cut starts in the source and how long it runs. The
+   * latency between click and hold is passed through untouched by
+   * construction — only the approach ahead of the click is shortened.
+   */
+  const preRollFor = (key: string, clickedAtKey: string, holdStartS: number): { srcStartS: number; durS: number } => {
+    const m = byShot.get(key);
+    if (!m) throw new Error(`no capture mark for shot "${key}"`);
+    const shotStartS = m.startMs / 1000;
+    const clickedMs = marks.evidence[clickedAtKey] as number | undefined;
+    const srcStartS =
+      clickedMs === undefined
+        ? shotStartS // pre-clickedAtMs capture: keep the whole approach
+        : Math.max(shotStartS, clickedMs / 1000 - APPROACH_LEAD_S);
+    return { srcStartS, durS: Math.max(0, holdStartS - srcStartS) };
+  };
+
+  /** Source window of a shot's static hold. */
+  const holdOf = (key: string): { startS: number; availS: number } => {
+    const m = byShot.get(key);
+    if (!m) throw new Error(`no capture mark for shot "${key}"`);
+    const endS = Math.min(m.endMs / 1000, captureDur);
+    const availS = m.specHoldS + pad;
+    return { startS: endS - availS, availS };
+  };
+
+  const blocks: Block[] = [];
+
+  /**
+   * Assemble one shot.
+   *
+   * `anchorCue` handles the two shots that contain a real injection wait: the
+   * narration is delayed so that cue lands just after the row appears, rather
+   * than the footage being cut to meet the words. That is the script's rule —
+   * the picture is real time, the voice moves.
+   */
+  function addShot(
+    key: string,
+    opts: {
+      kb: boolean;
+      punches?: (v: VoEntry) => Array<{ atS: number; durS: number; crop: Crop; label: string }>;
+      /** Real-time footage that runs before the hold — a clipped approach plus an injection wait. */
+      preRoll?: { srcStartS: number; durS: number };
+      anchorCue?: string;
+      fadeAtCue?: string;
+    },
+  ): void {
+    const v = voFor(key);
+    const { startS, availS } = holdOf(key);
+    const preRollS = opts.preRoll?.durS ?? 0;
+
+    /*
+     * Everything below is section-relative: t=0 is the first frame of the
+     * pre-roll, NOT the first frame of the hold. Conflating the two is how a
+     * 33s paragraph ends up reserving 49s of runtime.
+     */
+    let voStartS = LEAD_SILENCE;
+    if (opts.anchorCue) {
+      // Land the first cue 0.4s after the picture can support it. When the
+      // paragraph's own run-up already covers the wait, this stays at the
+      // lead silence and the narration simply plays over the latency.
+      voStartS = Math.max(LEAD_SILENCE, preRollS + 0.4 - cue(v, opts.anchorCue));
+    }
+    const durS = voStartS + v.duration + TAIL_SILENCE;
+    const holdNeededS = durS - preRollS;
+
+    if (holdNeededS > availS + 0.05) {
+      throw new Error(
+        `shot "${key}": needs ${holdNeededS.toFixed(1)}s of hold but the capture recorded ` +
+          `${availS.toFixed(1)}s. Raise HOLD.${key} in scripts/capture-demo.ts and re-capture — ` +
+          `do not speed up the audio.`,
+      );
+    }
+
+    // Punch cues are section-relative; the hold pieces are not.
+    const punches = (opts.punches?.(v) ?? [])
+      .map((p) => ({ ...p, atS: p.atS + voStartS - preRollS }))
+      .filter((p) => {
+        if (p.atS >= 0) return true;
+        console.warn(`  ! ${key}: punch "${p.label}" falls inside the wait and was dropped`);
+        return false;
+      });
+
+    const pieces = buildPieces({ holdStartS: startS, sectionDurS: holdNeededS, kb: opts.kb, punches });
+    if (opts.preRoll && preRollS > 0.03) {
+      pieces.unshift({
+        srcStartS: opts.preRoll.srcStartS,
+        durS: preRollS,
+        kb: opts.kb ? { from: KB_FROM, to: KB_FROM + (KB_TO - KB_FROM) * 0.4 } : undefined,
+        label: "click+wait (real time)",
+      });
+    }
+
+    let fadeFromS: number | undefined;
+    if (opts.fadeAtCue) fadeFromS = voStartS + cue(v, opts.fadeAtCue);
+
+    blocks.push({ kind: "shot", key, durS, label: key, pieces, vo: v, voStartS, fadeFromS });
+  }
+
+  // ── 00:00 cold open ──────────────────────────────────────────────────────
+  blocks.push({ kind: "black", durS: 2, label: "cold open" });
+
+  // ── 00:02 title card ─────────────────────────────────────────────────────
+  blocks.push({
+    kind: "card", durS: 1.5, label: "3:04 AM", letterbox: true,
+    lines: [{ text: "3:04 AM", size: 96, dy: 0 }],
+  });
+
+  // ── 00:03.5 shot 1 — the problem ─────────────────────────────────────────
+  addShot("blockedRow", {
+    kb: true,
+    punches: (v) => [
+      {
+        atS: cue(v, "paysTwice"),
+        durS: 2.0,
+        crop: cropAt(tgt("blockedRow", "caption"), 2.4, scale, video),
+        label: "punch-caption-2.4x",
+      },
+    ],
+  });
+
+  blocks.push({
+    kind: "card", durS: 1.5, label: "platform said failed",
+    lines: [{ text: "THE PLATFORM SAID IT FAILED.", size: 66, dy: 0 }],
+  });
+
+  // ── 00:22 shot 2 — the counters ──────────────────────────────────────────
+  addShot("counters", {
+    kb: true,
+    punches: (v) => {
+      const t = tgt("counters", "discrepancies");
+      return [
+        {
+          atS: cue(v, "zeroDouble"),
+          durS: 1.5,
+          crop: cropAt(t, zoomFor(t, scale, video.width, 0.72, 1.8, 2.6), scale, video),
+          label: "punch-discrepancies",
+        },
+      ];
+    },
+  });
+
+  // ── 00:35 shot 3 — proof one ─────────────────────────────────────────────
+  {
+    const { startS } = holdOf("reportedFailure");
+    // Clipped approach, then every frame of the real wait.
+    const preRoll = preRollFor("reportedFailure", "reportedFailureClickedAtMs", startS);
+
+    const reported = tgt("reportedFailure", "reported");
+    const chainTruth = tgt("reportedFailure", "chainTruth");
+    // The match cut: ONE crop size for both cells, each centred on its own —
+    // same size, same screen position, one word changes.
+    const matchZoom = Math.min(
+      zoomFor(reported, scale, video.width, 0.62, 1.7, 2.4),
+      zoomFor(chainTruth, scale, video.width, 0.62, 1.7, 2.4),
+    );
+
+    addShot("reportedFailure", {
+      kb: true,
+      preRoll,
+      anchorCue: "reportedFailed",
+      punches: (v) => {
+        const tReported = cue(v, "reportedFailed");
+        const tChain = cue(v, "chainTruth");
+        const stamp = tgt("reportedFailure", "stamp");
+        const caption = tgt("reportedFailure", "caption");
+        return [
+          {
+            atS: tReported,
+            durS: Math.min(1.5, Math.max(0.8, tChain - tReported)),
+            crop: cropAt(reported, matchZoom, scale, video),
+            label: "punch-reported",
+          },
+          {
+            atS: tChain,
+            durS: 1.5,
+            crop: cropAt(chainTruth, matchZoom, scale, video),
+            label: "matchcut-chaintruth",
+          },
+          {
+            atS: cue(v, "retryBlocked"),
+            durS: 1.6,
+            crop: cropAt(stamp, zoomFor(stamp, scale, video.width, 0.5, 1.9, 3.0), scale, video),
+            label: "punch-stamp",
+          },
+          {
+            atS: cue(v, "oneTransaction"),
+            durS: 2.4,
+            crop: cropAt(caption, 2.4, scale, video),
+            label: "punch-caption",
+          },
+        ];
+      },
+    });
+  }
+
+  blocks.push({
+    kind: "card", durS: 1.5, label: "chain said otherwise",
+    lines: [{ text: "THE CHAIN SAID OTHERWISE.", size: 66, dy: 0 }],
+  });
+
+  // ── 01:04.5 shot 4 — independent verification (dead still) ───────────────
+  {
+    const v = voFor("basescan");
+    const { startS, availS } = holdOf("basescan");
+    const hash = tgt("basescan", "hash");
+    const durS = LEAD_SILENCE + v.duration + TAIL_SILENCE;
+    if (durS > availS + 0.05) {
+      throw new Error(
+        `shot "basescan": needs ${durS.toFixed(1)}s but recorded ${availS.toFixed(1)}s — raise HOLD.basescan.`,
+      );
+    }
+    /*
+     * 1s punch onto the hash (cut from before the click, where the tape is on
+     * screen), then the explorer, held absolutely still — no Ken Burns, no
+     * move. Motion here would undercut the one shot whose job is
+     * "this is not our claim."
+     */
+    const punchDur = 1.0;
+    blocks.push({
+      kind: "shot", key: "basescan", durS, label: "basescan", vo: v, voStartS: LEAD_SILENCE,
+      pieces: [
+        {
+          srcStartS: hash.atMs / 1000,
+          durS: punchDur,
+          crop: cropAt(hash, zoomFor(hash, scale, video.width, 0.7, 1.8, 3.0), scale, video),
+          label: "punch-hash",
+        },
+        { srcStartS: startS, durS: durS - punchDur, label: "explorer (still)" },
+      ],
+    });
+  }
+
+  // ── 01:12.5 shot 5 — proof two ───────────────────────────────────────────
+  {
+    const { startS } = holdOf("gasSpike");
+    const preRoll = preRollFor("gasSpike", "gasSpikeClickedAtMs", startS);
+
+    addShot("gasSpike", {
+      kb: true,
+      preRoll,
+      anchorCue: "nothingSent",
+      punches: (v) => {
+        const noBroadcast = tgt("gasSpike", "noBroadcast");
+        const settled = tgt("gasSpike", "settled");
+        const both = tgt("gasSpike", "bothRows");
+        return [
+          {
+            atS: cue(v, "nothingSent"),
+            durS: 1.2,
+            crop: cropAt(noBroadcast, zoomFor(noBroadcast, scale, video.width, 0.5, 1.9, 3.0), scale, video),
+            label: "punch-no-broadcast",
+          },
+          {
+            atS: cue(v, "settlesForReal"),
+            durS: 1.4,
+            crop: cropAt(settled, zoomFor(settled, scale, video.width, 0.5, 1.9, 3.0), scale, video),
+            label: "punch-settled",
+          },
+          {
+            atS: cue(v, "twoRows"),
+            durS: 2.2,
+            crop: cropAt(both, zoomFor(both, scale, video.width, 0.94, 1.0, 1.35), scale, video),
+            label: "pull-back-both-rows",
+          },
+        ];
+      },
+    });
+  }
+
+  // ── 01:27.5 shot 6 — scale (the scroll is the motion) ────────────────────
+  addShot("settledHistory", { kb: false });
+
+  // ── 01:49.5 title card — the live counter ────────────────────────────────
+  const settledAfter = (marks.evidence.countersAtEnd as Record<string, string> | undefined)?.["Settled onchain"];
+  if (!settledAfter) throw new Error("marks.json has no countersAtEnd — the title card cannot quote a real number");
+  blocks.push({
+    kind: "card", durS: 1.5, label: "counter card",
+    lines: [
+      { text: `${settledAfter} SETTLEMENTS`, size: 58, dy: -46 },
+      { text: "EVERY INJECTED FAILURE CAUGHT · ZERO DOUBLE PAYMENTS", size: 34, dy: 34 },
+    ],
+  });
+
+  // ── 01:51 shot 7 — close ─────────────────────────────────────────────────
+  addShot("fullPage", { kb: true, fadeAtCue: "agentsCanAct" });
+  {
+    // Reverse push: 1.06 → 1.00, per the shot list.
+    const b = blocks[blocks.length - 1] as Extract<Block, { kind: "shot" }>;
+    for (const p of b.pieces) {
+      if (p.kb) p.kb = { from: KB_TO - (p.kb.from - KB_FROM), to: KB_TO - (p.kb.to - KB_FROM) };
+    }
+  }
+
+  // ── 0.5s of earned silence, then the last card ───────────────────────────
+  blocks.push({ kind: "black", durS: 0.5, label: "silence" });
+  blocks.push({
+    kind: "card", durS: 3.0, label: "RECKON", fadeOut: true,
+    lines: [
+      { text: "RECKON", size: 132, dy: -34 },
+      { text: "reckon-bay.vercel.app", size: 30, dy: 76 },
+    ],
+  });
+
+  // ── Plan report ──────────────────────────────────────────────────────────
+  console.log("\n  block                     start      dur   detail");
+  console.log("  " + "─".repeat(84));
+  let clock = 0;
+  const starts: number[] = [];
+  for (const b of blocks) {
+    starts.push(clock);
+    const detail =
+      b.kind === "shot"
+        ? `${b.pieces.length} pieces · vo ${b.vo.duration.toFixed(1)}s @+${b.voStartS.toFixed(1)}s` +
+          (b.pieces.some((p) => p.label.startsWith("click")) ? " · real wait included" : "")
+        : b.kind === "card"
+          ? b.lines[0].text.slice(0, 40)
+          : "";
+    console.log(
+      `  ${b.label.padEnd(24)} ${clock.toFixed(1).padStart(6)}s ${b.durS.toFixed(1).padStart(6)}s   ${detail}`,
+    );
+    clock += b.durS;
+  }
+  const totalS = clock;
+  const mmss = (s: number): string => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+  console.log("  " + "─".repeat(84));
+  console.log(`  total ${totalS.toFixed(1)}s (${mmss(totalS)})   target ${mmss(TARGET_S)}   cap ${mmss(HARD_CAP_S)}`);
+  if (totalS > HARD_CAP_S) {
+    throw new Error(
+      `${mmss(totalS)} exceeds the ${mmss(HARD_CAP_S)} hard cap. Shorten narration in demo/script.md — ` +
+        `never the audio, and never the injection latency.`,
+    );
+  }
+  if (totalS > TARGET_S + 3) {
+    console.warn(
+      `  ! ${mmss(totalS)} runs ${(totalS - TARGET_S).toFixed(0)}s over the ${mmss(TARGET_S)} target — ` +
+        `the real injection waits are in the cut, as the script requires.`,
+    );
+  }
+
+  // ── Render video ─────────────────────────────────────────────────────────
+  console.log("\n  rendering video…");
+  const pieces: string[] = [];
+  let vi = 0;
+  for (const [bi, b] of blocks.entries()) {
+    if (b.kind === "black") {
+      pieces.push(await renderBlack(b.durS, bi));
+    } else if (b.kind === "card") {
+      pieces.push(await renderCard(b, bi, font));
+    } else {
+      for (const p of b.pieces) {
+        if (p.durS <= 0.03) continue;
+        const out = join(WORK, `v${String(vi++).padStart(3, "0")}.mp4`);
+        await renderPiece(p, out);
+        pieces.push(out);
+      }
+    }
+  }
+
+  const listFile = join(WORK, "concat.txt");
+  await writeFile(listFile, pieces.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"));
+  let videoOnly = join(WORK, "video.mp4");
+  await ffmpeg(["-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", videoOnly]);
+
+  // The ¶7 fade toward black, applied across the concatenated timeline.
+  const closeIdx = blocks.findIndex((b) => b.kind === "shot" && b.key === "fullPage");
+  const close = blocks[closeIdx] as Extract<Block, { kind: "shot" }>;
+  if (close.fadeFromS !== undefined) {
+    const fadeStart = starts[closeIdx] + close.fadeFromS;
+    const fadeDur = Math.max(1.0, starts[closeIdx] + close.durS - fadeStart);
+    const faded = join(WORK, "video-faded.mp4");
+    await ffmpeg([
+      "-i", videoOnly,
+      "-vf", `fade=t=out:st=${fadeStart.toFixed(2)}:d=${fadeDur.toFixed(2)}`,
+      "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-r", String(FPS),
+      faded,
+    ]);
+    videoOnly = faded;
+    console.log(`  fade to black from ${fadeStart.toFixed(1)}s over ${fadeDur.toFixed(1)}s`);
+  }
+
+  // ── Audio ────────────────────────────────────────────────────────────────
+  console.log("  building audio…");
+  const silenceStart = starts[blocks.findIndex((b) => b.kind === "black" && b.label === "silence")];
+
+  const bedFile = join(WORK, "bed.wav");
+  await renderBed(silenceStart, bedFile);
+  const hitFile = join(WORK, "hit.wav");
+  await renderHit(hitFile);
+
+  /**
+   * The three stamp hits, frame-synced to a stamp landing. Two are named in the
+   * shot list (¶3 RETRY BLOCKED, ¶5 SETTLED); the third goes on ¶5's NO
+   * BROADCAST, the only other verdict stamp the film punches into.
+   */
+  const hitTimes: number[] = [];
+  for (const [i, b] of blocks.entries()) {
+    if (b.kind !== "shot") continue;
+    if (b.key === "reportedFailure") hitTimes.push(starts[i] + b.voStartS + cue(b.vo, "retryBlocked"));
+    if (b.key === "gasSpike") {
+      hitTimes.push(starts[i] + b.voStartS + cue(b.vo, "nothingSent"));
+      hitTimes.push(starts[i] + b.voStartS + cue(b.vo, "settlesForReal"));
+    }
+  }
+
+  const inputs: string[] = [];
+  const filters: string[] = [];
+  const mixLabels: string[] = [];
+  let idx = 0;
+
+  for (const [i, b] of blocks.entries()) {
+    if (b.kind !== "shot") continue;
+    const at = Math.round((starts[i] + b.voStartS) * 1000);
+    inputs.push("-i", join(VO, b.vo.file));
+    filters.push(`[${idx}:a]aresample=48000,adelay=${at}|${at}[n${idx}]`);
+    mixLabels.push(`[n${idx}]`);
+    idx++;
+  }
+
+  inputs.push("-i", bedFile);
+  filters.push(`[${idx}:a]volume=${BED_DB}dB,afade=t=in:st=2:d=3[bed]`);
+  mixLabels.push("[bed]");
+  idx++;
+
+  for (const t of hitTimes) {
+    const at = Math.round(t * 1000);
+    inputs.push("-i", hitFile);
+    filters.push(`[${idx}:a]volume=${HIT_DB}dB,adelay=${at}|${at}[h${idx}]`);
+    mixLabels.push(`[h${idx}]`);
+    idx++;
+  }
+
+  // Everything stops at the silence; the final card plays over nothing.
+  filters.push(
+    `${mixLabels.join("")}amix=inputs=${mixLabels.length}:normalize=0:dropout_transition=0,` +
+      `afade=t=out:st=${(silenceStart - 1.4).toFixed(2)}:d=1.4,` +
+      `atrim=0:${silenceStart.toFixed(3)},apad=whole_dur=${totalS.toFixed(3)},` +
+      `alimiter=limit=0.95,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[mix]`,
+  );
+
+  const audioOnly = join(WORK, "audio.m4a");
+  await ffmpeg([
+    ...inputs,
+    "-filter_complex", filters.join(";"),
+    "-map", "[mix]",
+    "-t", totalS.toFixed(3),
+    "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+    audioOnly,
+  ]);
+  console.log(`  narration ×${vo.length} · bed ${BED_DB}dB · hits at ${hitTimes.map((t) => t.toFixed(1)).join(", ")}s`);
+
+  // ── Mux ──────────────────────────────────────────────────────────────────
+  console.log("  muxing…");
+  await ffmpeg([
+    "-i", videoOnly,
+    "-i", audioOnly,
+    "-map", "0:v:0", "-map", "1:a:0",
+    "-c:v", "libx264", "-preset", "slow", "-crf", "20",
+    "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "192k",
+    "-movflags", "+faststart",
+    "-shortest",
+    FINAL,
+  ]);
+
+  await rm(WORK, { recursive: true, force: true });
+
+  const finalDur = await probeDuration(FINAL);
+  const { stdout: sizeOut } = await run("ffprobe", [
+    "-v", "error", "-show_entries", "format=size",
+    "-of", "default=noprint_wrappers=1:nokey=1", FINAL,
+  ]);
+  const mb = Number(sizeOut.trim()) / 1_048_576;
+
+  console.log(`\n  ${FINAL}`);
+  console.log(`  ${mmss(finalDur)}  ·  ${mb.toFixed(1)} MB  ·  H.264 ${W}x${H} ${FPS}fps\n`);
+  if (mb > 100) throw new Error(`final is ${mb.toFixed(1)} MB — over the 100 MB budget.`);
+}
+
+/**
+ * `--edl <file>` cuts the edit described by that file (the trailer).
+ * With no flag, this assembles the film exactly as it always has.
+ */
+const edlArgIdx = process.argv.indexOf("--edl");
+const edlArg = edlArgIdx > -1 ? process.argv[edlArgIdx + 1] : undefined;
+if (edlArgIdx > -1 && !edlArg) {
+  console.error("\nAssemble failed: --edl needs a path, e.g. --edl demo/trailer.edl.json");
+  process.exit(1);
+}
+
+const entry = edlArg ? buildFromEdl(join(process.cwd(), edlArg)) : main();
+
+entry.catch((err) => {
+  console.error("\nAssemble failed:", err.message);
+  process.exit(1);
+});
