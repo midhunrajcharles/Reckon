@@ -1,0 +1,268 @@
+@import "tailwindcss";
+/* Required by Lenis — without it the wrapper height is wrong and scrolling
+   fights the native scroller. */
+@import "lenis/dist/lenis.css";
+
+/*
+ * Reckon — the settlement tape as a paper ledger.
+ * Ink on paper, one green, one red. Colour is semantic only: nothing
+ * decorative wears a status colour.
+ */
+:root {
+  --bg: #e9e9e9;
+  --ink: #000000;
+  --green: #00846a;
+  /* Deepened from the old dark-theme red: #ff4d5e measures 2.67:1 on this
+     ground. This reads 5.17:1 — the discrepancy signal has to survive being
+     printed on paper. */
+  --blocked: #c0121f;
+  --hairline: rgba(0, 0, 0, 0.055);
+  /* Ledger rules need more presence than the grid, or the rows stop reading
+     as ruled paper. */
+  --rule: rgba(0, 0, 0, 0.14);
+
+  /* Grid cell. Tape rows are an exact half-cell so the rules keep its rhythm. */
+  --cell: 132px;
+  --row: 66px;
+
+  /*
+   * Scroll state, written once per frame by a single rAF driver and read
+   * from CSS. Nothing re-renders React on scroll — that was the jank.
+   * --sy: scroll offset in px · --sp: page progress 0–1 · --hp: hero progress 0–1
+   */
+  --sy: 0px;
+  --sp: 0;
+  --hp: 0;
+  --hb: 0px;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-ink: var(--ink);
+  --color-green: var(--green);
+  --color-blocked: var(--blocked);
+  --color-hairline: var(--hairline);
+  --color-rule: var(--rule);
+  --font-display: var(--font-instrument-serif);
+  --font-sans: var(--font-plex-sans);
+  --font-mono: var(--font-plex-mono);
+}
+
+html {
+  background: var(--bg);
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-plex-sans), system-ui, sans-serif;
+}
+
+/*
+ * Sentence rhythm: one sentence mixing black, grey and italic.
+ * `.aside` carries meaning, so it wears 65% ink (6.44:1). The faint grey of
+ * the reference fails on this ground and is reserved for marginalia — texture
+ * nobody has to read.
+ */
+.sentence {
+  font-weight: 200;
+  font-size: 21px;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
+}
+.sentence em {
+  font-family: var(--font-instrument-serif), Georgia, serif;
+  font-style: italic;
+  font-weight: 400;
+}
+.sentence .aside {
+  color: color-mix(in srgb, var(--ink) 65%, var(--bg));
+}
+
+/*
+ * Scroll-driven effects, composited from custom properties. transform and
+ * opacity are compositor-only; blur is the one expensive property, so it is
+ * capped low and the hero is promoted to its own layer.
+ */
+.hero-parallax {
+  transform: translate3d(0, calc(var(--sy) * 0.4), 0);
+  opacity: calc(1 - var(--hp) * 0.85);
+  will-change: transform, opacity, filter;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .hero-parallax {
+    filter: blur(var(--hb, 0px));
+  }
+}
+
+.drift {
+  transform: translate3d(0, calc(var(--sy) * var(--drift, 0)), 0);
+}
+
+/* scaleY, never height — animating height relayouts the page every frame. */
+.rail-fill {
+  transform: scaleY(var(--sp));
+  transform-origin: top;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero-parallax,
+  .drift,
+  .rail-fill {
+    transform: none;
+    filter: none;
+    opacity: 1;
+  }
+  .rail-fill {
+    transform: scaleY(var(--sp));
+  }
+}
+
+/* Tiny end of the type scale. There is no middle. */
+.micro {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  line-height: 1;
+}
+
+/* ---- Masthead intro: fade-up + letter-spacing settle, once, on first paint ---- */
+@keyframes mast-settle {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+    letter-spacing: 0.14em;
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    letter-spacing: -0.02em;
+  }
+}
+
+@keyframes rule-sweep {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+.mast-title {
+  letter-spacing: -0.02em;
+}
+.mast-rule {
+  transform-origin: left;
+  background: var(--green);
+  height: 2px;
+}
+
+/* ---- First-paint reveal. Never applied to tape rows: they arrive every 3s
+       and would blur-fade on every poll. ---- */
+@keyframes first-paint-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* New tape rows only: slide in and settle. */
+@keyframes row-settle {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* A verdict lands on the page like a rubber stamp. */
+@keyframes stamp-slam {
+  0% {
+    opacity: 0;
+    transform: scale(1.8) rotate(var(--stamp-rot, 0deg));
+  }
+  60% {
+    opacity: 1;
+    transform: scale(0.94) rotate(var(--stamp-rot, 0deg));
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) rotate(var(--stamp-rot, 0deg));
+  }
+}
+
+.stamp {
+  transform: rotate(var(--stamp-rot, 0deg));
+}
+
+/*
+ * The hero stamp — the only 3D in the build. A CSS perspective tilt that
+ * settles flat, with a small overshoot so it reads as a stamp hitting paper.
+ * No WebGL anywhere.
+ */
+@keyframes stamp-slam-3d {
+  0% {
+    opacity: 0;
+    transform: perspective(800px) rotateX(18deg) scale(1.4) rotate(var(--stamp-rot, 0deg));
+  }
+  68% {
+    opacity: 1;
+    transform: perspective(800px) rotateX(-2.5deg) scale(0.96) rotate(var(--stamp-rot, 0deg));
+  }
+  100% {
+    opacity: 1;
+    transform: perspective(800px) rotateX(0deg) scale(1) rotate(var(--stamp-rot, 0deg));
+  }
+}
+
+.stamp-3d {
+  transform: rotate(var(--stamp-rot, 0deg));
+  /* Ink bleed: the border and glyphs spread very slightly into the paper. */
+  box-shadow: 0 0 0 0.5px currentColor;
+  text-shadow: 0 0 0.6px currentColor;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .stamp-3d {
+    animation: stamp-slam-3d 280ms cubic-bezier(0.2, 0.9, 0.3, 1.35) both;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .mast-title {
+    animation: mast-settle 900ms cubic-bezier(0.7, 0, 0.15, 1) both;
+  }
+  .mast-rule {
+    animation: rule-sweep 1100ms cubic-bezier(0.7, 0, 0.15, 1) 180ms both;
+  }
+  .first-paint {
+    animation: first-paint-rise 700ms cubic-bezier(0.7, 0, 0.15, 1) both;
+  }
+  .tape-row {
+    animation: row-settle 320ms cubic-bezier(0.7, 0, 0.15, 1) both;
+  }
+  .stamp {
+    animation: stamp-slam 260ms cubic-bezier(0.2, 0.9, 0.3, 1.4) both;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
